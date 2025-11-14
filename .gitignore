@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+
+# Data
+data/
+cache/
+*.tar.gz
+*.log
+
+.venv/
