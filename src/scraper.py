@@ -111,6 +111,49 @@ class ArxivScraper:
         
         logger.info(f"Generated {len(paper_ids)} paper IDs")
         return paper_ids
+
+    def _normalize_authors(self, authors):
+        """
+        Normalize various author representations into a list of strings.
+
+        Handles:
+        - list of strings -> kept as-is
+        - list of [last, first, ...] -> converted to "First Last"
+        - list of dicts with 'name' -> uses that
+        - single string of authors separated by commas/semicolons -> split
+        """
+        if not authors:
+            return []
+
+        normalized = []
+        # If it's already a string, split into parts
+        if isinstance(authors, str):
+            parts = [p.strip() for p in authors.replace(';', ',').split(',') if p.strip()]
+            return parts
+
+        for a in authors:
+            if isinstance(a, str):
+                if a.strip():
+                    normalized.append(a.strip())
+            elif isinstance(a, dict):
+                name = a.get('name') or a.get('author') or ''
+                if name:
+                    normalized.append(name.strip())
+            elif isinstance(a, (list, tuple)):
+                # common Kaggle format: [last, first, ...]
+                if len(a) >= 2:
+                    last = a[0].strip() if a[0] else ''
+                    first = a[1].strip() if a[1] else ''
+                    if first and last:
+                        normalized.append(f"{first} {last}")
+                    elif first:
+                        normalized.append(first)
+                    elif last:
+                        normalized.append(last)
+                elif len(a) == 1 and a[0]:
+                    normalized.append(str(a[0]).strip())
+
+        return normalized
     
     def fetch_metadata(self, paper_ids):
         """Fetch only metadata (Stage 1.1)"""
@@ -180,7 +223,7 @@ class ArxivScraper:
         citations_lock = threading.Lock()
         completed_count = [0]  # Use list for mutability in closure
         
-        def fetch_single_citation(paper_id):
+        def _fetch_single_paper_citations(paper_id):
             try:
                 references = self.semantic_scholar_client.get_paper_references(paper_id)
                 
@@ -207,7 +250,7 @@ class ArxivScraper:
         
         # Use ThreadPoolExecutor for parallel fetching
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(fetch_single_citation, pid): pid for pid in papers_needing_citations}
+            futures = {executor.submit(_fetch_single_paper_citations, pid): pid for pid in papers_needing_citations}
             
             try:
                 for future in as_completed(futures):
@@ -230,14 +273,24 @@ class ArxivScraper:
     
     def update_references_json(self, metadata, citations, cited_metadata):
         """Update references.json for all papers with full citation data"""
+        if not citations:
+            logger.warning("No citations available, skipping references.json update")
+            return
+            
         logger.info("Updating references.json files...")
+        
+        # Ensure cited_metadata is a dict (not None)
+        if cited_metadata is None:
+            cited_metadata = {}
         
         updated_count = 0
         for paper_id in metadata.keys():
             folder_name = format_folder_name(paper_id)
             paper_dir = os.path.join(self.data_dir, folder_name)
+            metadata_file = os.path.join(paper_dir, 'metadata.json')
             
-            if not os.path.exists(paper_dir):
+            # Only create references.json if paper was successfully downloaded (has metadata.json)
+            if not os.path.exists(metadata_file):
                 continue
             
             if paper_id in citations:
@@ -261,6 +314,11 @@ class ArxivScraper:
         logger.info("=" * 80)
         
         stage_start = time.time()
+        
+        # Check if citations is valid
+        if not citations:
+            logger.warning("No citations available for Stage 1.3")
+            return {}
         
         # Check cache
         if os.path.exists(self.cited_dates_cache_file):
@@ -333,7 +391,7 @@ class ArxivScraper:
         processed_count = [0]
         process_lock = threading.Lock()
         
-        def process_paper_wrapper(paper_id):
+        def _process_paper_with_error_handling(paper_id):
             try:
                 paper_start = time.time()
                 paper_meta = metadata.get(paper_id) if metadata else None
@@ -361,7 +419,7 @@ class ArxivScraper:
         
         # Use ThreadPoolExecutor for parallel downloads
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(process_paper_wrapper, pid): pid for pid in papers_to_process}
+            futures = {executor.submit(_process_paper_with_error_handling, pid): pid for pid in papers_to_process}
             
             try:
                 for future in as_completed(futures):
@@ -376,6 +434,25 @@ class ArxivScraper:
                 raise
         
         logger.info(f"Stage 2 completed: {processed_count[0]} processed, {skipped_count} skipped")
+        
+        # Update references.json for skipped papers (only if they have metadata.json)
+        if citations and cited_metadata is not None:
+            logger.info("Updating references.json for skipped papers...")
+            skipped_updated = 0
+            for paper_id in paper_ids:
+                folder_name = format_folder_name(paper_id)
+                paper_dir = os.path.join(self.data_dir, folder_name)
+                metadata_file = os.path.join(paper_dir, 'metadata.json')
+                references_file = os.path.join(paper_dir, 'references.json')
+                
+                # Only create references.json if paper was successfully downloaded (has metadata.json)
+                if os.path.exists(metadata_file) and not os.path.exists(references_file):
+                    if paper_id in citations:
+                        self._save_references_for_paper(paper_id, paper_dir, citations[paper_id], cited_metadata)
+                        skipped_updated += 1
+            
+            if skipped_updated > 0:
+                logger.info(f"Created references.json for {skipped_updated} skipped papers")
         
         stage_time = time.time() - stage_start
         self.monitor.record_stage_time('Stage 2: Download and processing', stage_time)
@@ -454,7 +531,7 @@ class ArxivScraper:
                 version_tex_dir = os.path.join(tex_dir, f"{folder_name}v{version_num}")
                 
                 # Copy tex and bib files to version subdirectory (preserving structure and filenames)
-                self.file_processor.copy_tex_files(version_temp_dir, version_tex_dir)
+                self.file_processor.copy_tex_and_bib_files(version_temp_dir, version_tex_dir)
                 
                 # Cleanup version temp dir and tar file
                 self.file_processor.cleanup_temp_dir(version_temp_dir)
@@ -509,13 +586,17 @@ class ArxivScraper:
                 
                 # Get metadata from cited_metadata or use basic info
                 if cited_metadata and ref_id in cited_metadata:
-                    ref_meta = cited_metadata[ref_id]
+                    ref_meta = {
+                        'title': cited_metadata[ref_id].get('title', ''),
+                        'authors': self._normalize_authors(cited_metadata[ref_id].get('authors', [])),
+                        'submission_date': cited_metadata[ref_id].get('submission_date', ''),
+                        'semantic_scholar_id': ref.get('semantic_scholar_id', '')
+                    }
                 else:
                     # Fallback to what we have from Semantic Scholar
                     ref_meta = {
-                        'arxiv_id': ref_id,
                         'title': ref.get('title', ''),
-                        'authors': ref.get('authors', []),
+                        'authors': self._normalize_authors(ref.get('authors', [])),
                         'submission_date': ref.get('publication_date', ''),
                         'semantic_scholar_id': ref.get('semantic_scholar_id', '')
                     }
@@ -526,53 +607,6 @@ class ArxivScraper:
         ref_output = os.path.join(paper_dir, 'references.json')
         with open(ref_output, 'w', encoding='utf-8') as f:
             json.dump(references_dict, f, indent=2)
-    
-    def save_references_json(self, metadata, citations, cited_metadata):
-        """
-        Save references.json for each paper
-        
-        Args:
-            metadata: Main paper metadata
-            citations: Citations dictionary
-            cited_metadata: Cited paper metadata
-        """
-        logger.info("Saving references.json files...")
-        
-        for paper_id, refs in citations.items():
-            folder_name = format_folder_name(paper_id)
-            paper_dir = os.path.join(self.data_dir, folder_name)
-            
-            if not os.path.exists(paper_dir):
-                continue
-            
-            references_dict = {}
-            
-            for ref in refs:
-                if 'arxiv_id' in ref:
-                    ref_id = ref['arxiv_id']
-                    ref_folder_name = format_folder_name(ref_id)
-                    
-                    # Get metadata from cited_metadata or use basic info
-                    if ref_id in cited_metadata:
-                        ref_meta = cited_metadata[ref_id]
-                    else:
-                        # Fallback to what we have from Semantic Scholar
-                        ref_meta = {
-                            'arxiv_id': ref_id,
-                            'title': ref.get('title', ''),
-                            'authors': ref.get('authors', []),
-                            'submission_date': ref.get('publication_date', ''),
-                            'revised_dates': []
-                        }
-                    
-                    references_dict[ref_folder_name] = ref_meta
-            
-            # Save references.json
-            ref_output = os.path.join(paper_dir, 'references.json')
-            with open(ref_output, 'w', encoding='utf-8') as f:
-                json.dump(references_dict, f, indent=2)
-        
-        logger.info("Finished saving references.json files")
     
     def run(self):
         """Run the complete scraping pipeline with parallel stages"""
@@ -593,11 +627,12 @@ class ArxivScraper:
             
             logger.info(f"Will process {len(paper_ids)} papers")
             
-            # Run 3 stages in parallel using separate threads
-            logger.info("Launching parallel stages: metadata, download, citations...")
+            # Run 4 stages in parallel using separate threads
+            logger.info("Launching parallel stages: metadata, download, citations, cited_metadata...")
             
             metadata = {}
             citations = {}
+            cited_metadata = {}
             stage_errors = []
             
             def stage1_metadata():
@@ -618,20 +653,28 @@ class ArxivScraper:
                     stage_errors.append(('download', e))
             
             def stage3_citations():
+                nonlocal citations, cited_metadata
                 try:
                     logger.info("Stage 1.2: Fetching citations...")
-                    nonlocal citations
                     citations = self.fetch_citations(paper_ids)
+                    
+                    # After citations are fetched, fetch cited metadata
+                    if citations:
+                        logger.info("Stage 1.3: Fetching cited paper metadata...")
+                        cited_metadata = self.fetch_cited_metadata(citations)
+                    else:
+                        logger.warning("No citations available, skipping Stage 1.3")
+                        cited_metadata = {}
                 except Exception as e:
-                    logger.error(f"Stage 1.2 failed: {e}")
+                    logger.error(f"Stage 1.2/1.3 failed: {e}")
                     stage_errors.append(('citations', e))
             
-            # Launch all 3 stages in parallel
+            # Launch all 3 stages in parallel (Stage 1.3 runs inside Stage 1.2 thread)
             import threading
             threads = [
                 threading.Thread(target=stage1_metadata, name="Stage-Metadata"),
                 threading.Thread(target=stage2_download, name="Stage-Download"),
-                threading.Thread(target=stage3_citations, name="Stage-Citations")
+                threading.Thread(target=stage3_citations, name="Stage-Citations-CitedMetadata")
             ]
             
             for thread in threads:
@@ -644,12 +687,13 @@ class ArxivScraper:
             if stage_errors:
                 logger.error(f"Some stages failed: {stage_errors}")
             
-            # Stage 1.3: Fetch cited paper metadata
-            cited_metadata = self.fetch_cited_metadata(citations)
-            
             # Update references.json files with full citation data
-            logger.info("Updating references.json with citation metadata...")
-            self.update_references_json(metadata, citations, cited_metadata)
+            # Only run if we have valid metadata and citations
+            if metadata and citations:
+                logger.info("Updating references.json with citation metadata...")
+                self.update_references_json(metadata, citations, cited_metadata)
+            else:
+                logger.warning("Cannot update references.json: missing metadata or citations")
             
             logger.info("=" * 80)
             logger.info("Scraping completed successfully!")

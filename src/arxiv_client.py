@@ -53,18 +53,11 @@ class ArxivClient:
                             arxiv_id = paper.entry_id.split('/')[-1].split('v')[0]  # Extract ID
                             
                             metadata = {
-                                'arxiv_id': arxiv_id,
                                 'title': paper.title,
                                 'authors': [author.name for author in paper.authors],
-                                'abstract': paper.summary,
-                                'categories': paper.categories,
-                                'primary_category': paper.primary_category,
                                 'submission_date': paper.published.isoformat(),
                                 'revised_dates': [],
-                                'versions': [],
-                                'doi': paper.doi,
-                                'journal_ref': paper.journal_ref,
-                                'comment': paper.comment
+                                'journal_ref': paper.journal_ref
                             }
                             
                             # Get version information
@@ -74,12 +67,7 @@ class ArxivClient:
                                     versions = [versions]
                                 
                                 for version in versions:
-                                    version_num = version.get('version', '')
                                     created = version.get('created', '')
-                                    metadata['versions'].append({
-                                        'version': version_num,
-                                        'created': created
-                                    })
                                     metadata['revised_dates'].append(created)
                             
                             # Fallback if version info not available
@@ -134,18 +122,11 @@ class ArxivClient:
                 
                 # Extract metadata
                 metadata = {
-                    'arxiv_id': arxiv_id,
                     'title': paper.title,
                     'authors': [author.name for author in paper.authors],
-                    'abstract': paper.summary,
-                    'categories': paper.categories,
-                    'primary_category': paper.primary_category,
                     'submission_date': paper.published.isoformat(),
                     'revised_dates': [],
-                    'versions': [],
-                    'doi': paper.doi,
-                    'journal_ref': paper.journal_ref,
-                    'comment': paper.comment
+                    'journal_ref': paper.journal_ref
                 }
                 
                 # Get version information
@@ -155,12 +136,7 @@ class ArxivClient:
                         versions = [versions]
                     
                     for version in versions:
-                        version_num = version.get('version', '')
                         created = version.get('created', '')
-                        metadata['versions'].append({
-                            'version': version_num,
-                            'created': created
-                        })
                         metadata['revised_dates'].append(created)
                 
                 # Fallback if version info not available

@@ -64,23 +64,6 @@ class FileProcessor:
                     tex_files.append(os.path.join(root, file))
         return tex_files
     
-    def find_bib_files(self, directory):
-        """
-        Find all .bib files in directory
-        
-        Args:
-            directory: Directory to search
-            
-        Returns:
-            list: List of .bib file paths
-        """
-        bib_files = []
-        for root, dirs, files in os.walk(directory):
-            for file in files:
-                if file.endswith('.bib'):
-                    bib_files.append(os.path.join(root, file))
-        return bib_files
-    
     def remove_figures(self, directory):
         """
         Remove figure files to reduce size
@@ -132,7 +115,7 @@ class FileProcessor:
                     pass
         return total_size
     
-    def copy_tex_files(self, source_dir, dest_dir):
+    def copy_tex_and_bib_files(self, source_dir, dest_dir):
         """
         Copy all .tex and .bib files from source to destination, preserving directory structure
         
@@ -144,9 +127,13 @@ class FileProcessor:
             int: Number of files copied
         """
         os.makedirs(dest_dir, exist_ok=True)
-        tex_files = self.find_tex_files(source_dir)
-        bib_files = self.find_bib_files(source_dir)
-        all_files = tex_files + bib_files
+        
+        # Find all .tex and .bib files
+        all_files = []
+        for root, dirs, files in os.walk(source_dir):
+            for file in files:
+                if file.endswith('.tex') or file.endswith('.bib'):
+                    all_files.append(os.path.join(root, file))
         
         copied = 0
         for file_path in all_files:
@@ -165,43 +152,6 @@ class FileProcessor:
         
         logger.info(f"Copied {copied} .tex and .bib files to {dest_dir}")
         return copied
-    
-    def merge_bib_files(self, source_dir, output_file, append=False):
-        """
-        Merge all .bib files into one
-        
-        Args:
-            source_dir: Source directory
-            output_file: Output .bib file path
-            append: If True, append to existing file instead of overwriting
-            
-        Returns:
-            int: Number of .bib files merged
-        """
-        bib_files = self.find_bib_files(source_dir)
-        
-        if not bib_files:
-            logger.warning(f"No .bib files found in {source_dir}")
-            return 0
-        
-        try:
-            mode = 'a' if append else 'w'
-            with open(output_file, mode, encoding='utf-8', errors='ignore') as outf:
-                for bib_file in bib_files:
-                    try:
-                        with open(bib_file, 'r', encoding='utf-8', errors='ignore') as inf:
-                            content = inf.read()
-                            outf.write(content)
-                            outf.write('\n\n')
-                    except Exception as e:
-                        logger.warning(f"Failed to read {bib_file}: {e}")
-            
-            logger.info(f"Merged {len(bib_files)} .bib files into {output_file}")
-            return len(bib_files)
-        
-        except Exception as e:
-            logger.error(f"Failed to create merged .bib file: {e}")
-            return 0
     
     def cleanup_temp_dir(self, directory):
         """
