@@ -8,7 +8,7 @@ This project implements a comprehensive arXiv paper scraper that collects full-t
 
 - Python 3.8 or higher
 - Internet connection for API access
-- Kaggle arXiv metadata dataset (optional but recommended for Stage 1.3)
+- Kaggle arXiv metadata dataset
 
 ## Installation
 
@@ -45,16 +45,39 @@ This will install:
 - `arxiv`: Python wrapper for arXiv API
 - `requests`: HTTP library for Semantic Scholar API
 - `psutil`: Process and system utilities for performance monitoring
+- `kaggle`: Kaggle API client for downloading datasets
 
-### 4. Download Kaggle dataset (Optional but recommended)
+### 4. Download Kaggle dataset (Required for Stage 1.3)
 
-For optimal performance in Stage 1.3, download the Kaggle arXiv metadata:
+The Kaggle arXiv metadata dataset is **required** for Stage 1.3 to fetch submission dates for cited papers.
+
+#### Option 1: Using Kaggle CLI (Recommended)
+
+1. **Setup Kaggle API credentials:**
+   - Go to https://www.kaggle.com/settings/account
+   - Scroll to "API" section
+   - Click "Create New Token" → downloads `kaggle.json`
+   - Move the file to:
+     - Windows: `C:\Users\<username>\.kaggle\kaggle.json`
+     - Linux/Mac: `~/.kaggle/kaggle.json`
+   - Set permissions (Linux/Mac): `chmod 600 ~/.kaggle/kaggle.json`
+
+2. **Download the dataset:**
+   ```bash
+   # From project root directory
+   kaggle datasets download -d Cornell-University/arxiv --unzip
+   ```
+
+   This downloads `arxiv-metadata-oai-snapshot.json` (~4.7GB) to the project root.
+
+#### Option 2: Manual Download
 
 1. Go to: https://www.kaggle.com/datasets/Cornell-University/arxiv
-2. Download `arxiv-metadata-oai-snapshot.json`
-3. Place it in the project root directory
+2. Click "Download" (requires Kaggle account)
+3. Extract `arxiv-metadata-oai-snapshot.json`
+4. Place it in the project root directory
 
-**Note:** If this file is not present, the scraper will still work but Stage 1.3 will be skipped or use fallback methods.
+**Note:** Without this file, Stage 1.3 will be skipped and `references.json` will be missing the required `submission_date` field, causing the submission to be incomplete.
 
 ## Project Structure
 
@@ -98,28 +121,71 @@ python scraper.py 23127XXX 3
 
 ### What the Scraper Does
 
-The scraper executes the following pipeline:
+The scraper executes an **optimized parallel pipeline** to maximize efficiency:
 
-1. **Stage 1.1 - Metadata Collection**: Fetches metadata for assigned papers using arXiv API
-   - Retrieves title, authors, abstract, submission dates, revised dates, versions
-   - Saves to cache file for resumability
+#### Parallel Execution Model
 
-2. **Stage 1.2 - Citation Retrieval**: Gets citation lists using Semantic Scholar API
-   - Collects references for each paper
-   - Extracts arXiv IDs from references
-   - Saves to cache file
+The scraper runs multiple stages **simultaneously** using threading:
 
-3. **Stage 1.3 - Cited Paper Metadata**: Retrieves metadata for cited papers from Kaggle dataset
-   - Efficiently loads metadata for thousands of cited papers
-   - Much faster than individual API calls
-   - Saves to cache file
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    PARALLEL STAGES                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Stage 1.1 (Metadata) ──────────────────────────► Cache    │
+│                                                             │
+│  Stage 2 (Download) ─────────────────────────────► Data    │
+│                                                             │
+│  Stage 1.2 (Citations) ──┬──────────────────────► Cache    │
+│                          │                                  │
+│                          └──► Stage 1.3 (Cited) ──► Cache  │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
 
-4. **Stage 2 - Download and Processing**: Downloads source files and processes them
-   - Downloads `.tar.gz` source files
-   - Extracts and identifies `.tex` and `.bib` files
-   - Removes figure files to reduce size
-   - Organizes files into structured directories
+**Stage Details:**
+
+**1. Stage 1.1 - Metadata Collection** (Parallel Thread 1)
+   - Fetches metadata for assigned papers using arXiv API
+   - Retrieves: title, authors, abstract, submission dates, revised dates, versions
+   - Saves to cache: `<STUDENT_ID>_metadata.json`
+   - Rate limit: 3 seconds between API calls
+
+**2. Stage 2 - Download and Processing** (Parallel Thread 2)
+   - Runs **independently** and **simultaneously** with other stages
+   - Downloads `.tar.gz` source files for all paper versions
+   - Extracts and validates TeX source files
+   - Identifies and copies `.tex` and `.bib` files
+   - Removes figure files to reduce storage
+   - Organizes files into version-specific directories
    - Creates `metadata.json` and `references.json` for each paper
+   - Uses multi-threading (8 workers by default) for parallel downloads
+
+**3. Stage 1.2 - Citation Retrieval** (Parallel Thread 3)
+   - Gets citation lists using Semantic Scholar API
+   - Collects references for each paper
+   - Extracts arXiv IDs and SemanticScholar IDs from references
+   - Saves to cache: `<STUDENT_ID>_citations.json`
+   - Rate limit: 1 second between API calls
+
+**4. Stage 1.3 - Cited Paper Metadata** (Sequential after Stage 1.2)
+   - **Automatically starts** after Stage 1.2 completes in the same thread
+   - Runs **in parallel** with Stage 2 (if still running)
+   - Efficiently loads metadata for cited papers from Kaggle dataset
+   - Scans local file (no API calls) - much faster than individual requests
+   - Saves to cache: `<STUDENT_ID>_cited_dates.json`
+
+**5. Final Stage - Update References**
+   - Runs after all parallel stages complete
+   - Updates `references.json` files with full citation metadata
+   - Combines data from all previous stages
+
+#### Performance Benefits
+
+- **3x faster**: Stages 1.1, 1.2, and 2 run simultaneously
+- **Resumable**: All stages cache results - interrupted runs can resume
+- **Network optimized**: Stage 2 uses 8 parallel workers for downloads
+- **I/O optimized**: Stage 1.3 runs while Stage 2 is still downloading
 
 ### Output Structure
 
@@ -128,14 +194,18 @@ The scraper creates the following directory structure in `data/<STUDENT_ID>/`:
 ```
 data/
 └── <STUDENT_ID>/
-    ├── <YYYYMM-ID>/           # One folder per paper
-    │   ├── tex/               # LaTeX source files
-    │   │   ├── main.tex
-    │   │   └── ...
-    │   ├── references.bib     # Merged bibliography file
-    │   ├── metadata.json      # Paper metadata
-    │   └── references.json    # Cited paper metadata
-    └── performance_report.json  # Performance statistics
+    ├── <yymm-id>/                    # One folder per paper (e.g., "2402-10011")
+    │   ├── tex/                      # LaTeX source directory
+    │   │   ├── <yymm-id>v<version>/  # Version subdirectory (e.g., "2402-10011v1")
+    │   │   │   ├── *.tex             # TeX files (original structure preserved)
+    │   │   │   ├── *.bib             # BibTeX files (original structure preserved)
+    │   │   │   └── <subfolders>/     # Subdirectories with TeX/bib files
+    │   │   │       ├── *.tex
+    │   │   │       └── *.bib
+    │   │   └── <yymm-id>v<version>/  # Additional versions...
+    │   ├── metadata.json             # Paper metadata
+    │   └── references.json           # Cited paper metadata
+    └── performance_report.json       # Auto-generated statistics (for monitoring only)
 ```
 
 ### Cache Files
@@ -152,10 +222,10 @@ Cache files are stored in `cache/` directory:
 Edit `src/config.py` to customize:
 
 - `ARXIV_API_DELAY`: Delay between arXiv API calls (default: 3.0 seconds)
-- `SEMANTIC_SCHOLAR_DELAY`: Delay between Semantic Scholar API calls (default: 1.1 seconds)
+- `SEMANTIC_SCHOLAR_DELAY`: Delay between Semantic Scholar API calls (default: 1.0 seconds)
 - `MAX_RETRIES`: Number of retry attempts for failed requests (default: 3)
-- `MAX_WORKERS`: Number of parallel workers for downloads (default: 4)
-- `KAGGLE_METADATA_PATH`: Path to Kaggle dataset file
+- `MAX_WORKERS`: Number of parallel workers for downloads (default: 8)
+- `KAGGLE_METADATA_PATH`: Path to Kaggle dataset file (default: `../arxiv-metadata-oai-snapshot.json`)
 
 ## Performance Monitoring
 
@@ -181,7 +251,7 @@ Logs are written to:
 Make sure your student ID exists in `TCTA-DS1.csv` in the project root.
 
 ### "Kaggle metadata file not found"
-Download the Kaggle dataset as described in Installation step 4. The scraper can still run without it but performance will be degraded.
+Download the Kaggle dataset as described in Installation step 4. **This file is required** for the scraper to generate complete `references.json` files with submission dates. Without it, the output will be incomplete and fail requirements.
 
 ### "Rate limit exceeded"
 The scraper includes built-in rate limiting, but if you encounter 429 errors:
@@ -203,7 +273,3 @@ If you encounter memory problems:
 - Figure files are automatically removed to save space
 - All dates are stored in ISO format
 - The scraper is designed to handle failures gracefully and continue processing
-
-## Support
-
-For questions or issues, contact the course instructor as specified in the lab description.
