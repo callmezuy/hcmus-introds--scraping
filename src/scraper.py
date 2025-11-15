@@ -5,17 +5,18 @@ import os
 import json
 import time
 import threading
+import argparse
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import (
     get_assigned_range, format_arxiv_id, format_folder_name,
-    DATA_DIR, CACHE_DIR, KAGGLE_METADATA_PATH, MAX_WORKERS
+    DATA_DIR, CACHE_DIR, MAX_WORKERS, SEMANTIC_SCHOLAR_WORKERS
 )
 from logger import setup_logger
 from performance import PerformanceMonitor
 from arxiv_client import ArxivClient
 from semantic_scholar_client import SemanticScholarClient
-from kaggle_handler import KaggleMetadataHandler
 from file_processor import FileProcessor
 
 logger = setup_logger(__name__)
@@ -23,7 +24,7 @@ logger = setup_logger(__name__)
 class ArxivScraper:
     """Main scraper class orchestrating the entire pipeline"""
     
-    def __init__(self, student_id, max_papers=None):
+    def __init__(self, student_id, max_papers=None, skip_large_bib=True, bib_size_threshold=5*1024*1024, skip_missing_source=True):
         """
         Initialize scraper
         
@@ -33,11 +34,14 @@ class ArxivScraper:
         """
         self.student_id = str(student_id)
         self.max_papers = max_papers
-        self.arxiv_client = ArxivClient()
-        self.semantic_scholar_client = SemanticScholarClient(api_key="9JcwvT4mJ39GR0cF7ntcB34Qg2pCJSS614DhOP2y")
-        self.kaggle_handler = KaggleMetadataHandler(KAGGLE_METADATA_PATH)
-        self.file_processor = FileProcessor()
+        # Monitor should be created before clients/processors that may use it
         self.monitor = PerformanceMonitor()
+        self.arxiv_client = ArxivClient(monitor=self.monitor)
+        self.semantic_scholar_client = SemanticScholarClient(api_key="9JcwvT4mJ39GR0cF7ntcB34Qg2pCJSS614DhOP2y", monitor=self.monitor)
+        self.file_processor = FileProcessor(monitor=self.monitor)
+        # Options for skipping large .bib files when copying
+        self.skip_large_bib = skip_large_bib
+        self.bib_size_threshold = bib_size_threshold
         
         # Get assigned paper range
         self.paper_range = get_assigned_range(student_id)
@@ -55,6 +59,8 @@ class ArxivScraper:
         self.metadata_cache_file = os.path.join(self.cache_dir, f"{self.student_id}_metadata.json")
         self.citations_cache_file = os.path.join(self.cache_dir, f"{self.student_id}_citations.json")
         self.cited_dates_cache_file = os.path.join(self.cache_dir, f"{self.student_id}_cited_dates.json")
+        # Behavior: whether to skip papers that have no downloadable source
+        self.skip_missing_source = skip_missing_source
     
     def generate_paper_ids(self):
         """
@@ -111,49 +117,6 @@ class ArxivScraper:
         
         logger.info(f"Generated {len(paper_ids)} paper IDs")
         return paper_ids
-
-    def _normalize_authors(self, authors):
-        """
-        Normalize various author representations into a list of strings.
-
-        Handles:
-        - list of strings -> kept as-is
-        - list of [last, first, ...] -> converted to "First Last"
-        - list of dicts with 'name' -> uses that
-        - single string of authors separated by commas/semicolons -> split
-        """
-        if not authors:
-            return []
-
-        normalized = []
-        # If it's already a string, split into parts
-        if isinstance(authors, str):
-            parts = [p.strip() for p in authors.replace(';', ',').split(',') if p.strip()]
-            return parts
-
-        for a in authors:
-            if isinstance(a, str):
-                if a.strip():
-                    normalized.append(a.strip())
-            elif isinstance(a, dict):
-                name = a.get('name') or a.get('author') or ''
-                if name:
-                    normalized.append(name.strip())
-            elif isinstance(a, (list, tuple)):
-                # common Kaggle format: [last, first, ...]
-                if len(a) >= 2:
-                    last = a[0].strip() if a[0] else ''
-                    first = a[1].strip() if a[1] else ''
-                    if first and last:
-                        normalized.append(f"{first} {last}")
-                    elif first:
-                        normalized.append(first)
-                    elif last:
-                        normalized.append(last)
-                elif len(a) == 1 and a[0]:
-                    normalized.append(str(a[0]).strip())
-
-        return normalized
     
     def fetch_metadata(self, paper_ids):
         """Fetch only metadata (Stage 1.1)"""
@@ -192,64 +155,112 @@ class ArxivScraper:
     
     def fetch_citations(self, paper_ids):
         """Fetch citations using parallel threads with caching and resume support"""
-        # Check cache
+        # Check cache (defensive: handle corrupt/null cache files)
         if os.path.exists(self.citations_cache_file):
             with open(self.citations_cache_file, 'r', encoding='utf-8') as f:
-                citations = json.load(f)
-            if len(citations) >= len(paper_ids):
-                logger.info(f"Loaded {len(citations)} citations from cache")
-                # Track cached citations statistics
+                try:
+                    raw = json.load(f)
+                except Exception as e:
+                    logger.warning(f"Unable to parse citations cache, starting fresh: {e}")
+                    raw = None
+
+            # Ensure we have a dict; if file contained null or other type, reset to {}
+            if isinstance(raw, dict):
+                citations = raw
+            else:
+                citations = {}
+
+            # If cache already contains enough entries, return it
+            try:
+                if len(citations) >= len(paper_ids):
+                    logger.info(f"Loaded {len(citations)} citations from cache")
+                    # Track cached citations statistics
+                    for paper_id, references in citations.items():
+                        if paper_id in paper_ids:
+                            refs = references or []
+                            self.monitor.increment_stat('total_references', len(refs))
+                            arxiv_references = [ref for ref in refs if isinstance(ref, dict) and 'arxiv_id' in ref]
+                            self.monitor.increment_stat('successful_references', len(arxiv_references))
+                            self.monitor.increment_stat('failed_references', len(refs) - len(arxiv_references))
+                    return citations
+                logger.info(f"Resuming: loaded {len(citations)} citations from partial cache")
+                # Track partial cached citations
                 for paper_id, references in citations.items():
-                    if paper_id in paper_ids:
-                        self.monitor.increment_stat('total_references', len(references))
-                        arxiv_references = [ref for ref in references if 'arxiv_id' in ref]
-                        self.monitor.increment_stat('successful_references', len(arxiv_references))
-                        self.monitor.increment_stat('failed_references', len(references) - len(arxiv_references))
-                return citations
-            logger.info(f"Resuming: loaded {len(citations)} citations from partial cache")
-            # Track partial cached citations
-            for paper_id, references in citations.items():
-                self.monitor.increment_stat('total_references', len(references))
-                arxiv_references = [ref for ref in references if 'arxiv_id' in ref]
-                self.monitor.increment_stat('successful_references', len(arxiv_references))
-                self.monitor.increment_stat('failed_references', len(references) - len(arxiv_references))
+                    refs = references or []
+                    self.monitor.increment_stat('total_references', len(refs))
+                    arxiv_references = [ref for ref in refs if isinstance(ref, dict) and 'arxiv_id' in ref]
+                    self.monitor.increment_stat('successful_references', len(arxiv_references))
+                    self.monitor.increment_stat('failed_references', len(refs) - len(arxiv_references))
+            except TypeError:
+                # Unexpected cache content; reset and continue
+                logger.warning("Citations cache contains non-iterable entries; resetting cache")
+                citations = {}
         else:
             citations = {}
         
         # Fetch remaining citations with threading
         papers_needing_citations = [pid for pid in paper_ids if pid not in citations]
-        logger.info(f"Fetching {len(papers_needing_citations)} citations using {MAX_WORKERS} threads")
+        logger.info(f"Fetching {len(papers_needing_citations)} citations using {SEMANTIC_SCHOLAR_WORKERS} threads")
         
         citations_lock = threading.Lock()
         completed_count = [0]  # Use list for mutability in closure
-        
+
         def _fetch_single_paper_citations(paper_id):
             try:
                 references = self.semantic_scholar_client.get_paper_references(paper_id)
-                
+                # Defensive: ensure references is a list (API or cache may return None)
+                if not references or not isinstance(references, list):
+                    references = []
+
                 with citations_lock:
                     citations[paper_id] = references
                     completed_count[0] += 1
-                    
+
                     self.monitor.sample_memory()
                     self.monitor.increment_stat('total_references', len(references))
-                    arxiv_references = [ref for ref in references if 'arxiv_id' in ref]
+                    arxiv_references = [ref for ref in references if isinstance(ref, dict) and 'arxiv_id' in ref]
                     self.monitor.increment_stat('successful_references', len(arxiv_references))
                     self.monitor.increment_stat('failed_references', len(references) - len(arxiv_references))
-                    
+
                     # Save cache periodically
                     if completed_count[0] % 100 == 0:
-                        with open(self.citations_cache_file, 'w', encoding='utf-8') as f:
-                            json.dump(citations, f, indent=2)
-                        logger.info(f"Progress saved: {completed_count[0]}/{len(papers_needing_citations)} citations")
-                
+                        try:
+                            with open(self.citations_cache_file, 'w', encoding='utf-8') as f:
+                                json.dump(citations, f, indent=2)
+                            logger.info(f"Progress saved: {completed_count[0]}/{len(papers_needing_citations)} citations")
+                        except Exception as e:
+                            logger.error(f"Failed to save citations cache: {e}")
+
+                # Attempt per-paper incremental write
+                try:
+                    folder_name = format_folder_name(paper_id)
+                    paper_dir = os.path.join(self.data_dir, folder_name)
+                    metadata_file = os.path.join(paper_dir, 'metadata.json')
+                    if os.path.exists(metadata_file) and paper_id in citations:
+                        # Load cited metadata cache if available (best-effort)
+                        cited_meta = {}
+                        try:
+                            if os.path.exists(self.cited_dates_cache_file):
+                                with open(self.cited_dates_cache_file, 'r', encoding='utf-8') as cf:
+                                    cited_meta = json.load(cf) or {}
+                        except Exception:
+                            cited_meta = {}
+
+                        # Save references for this paper now
+                        try:
+                            self._save_references_for_paper(paper_id, paper_dir, citations[paper_id], cited_meta)
+                        except Exception as e:
+                            logger.error(f"Error saving incremental references for {paper_id}: {e}")
+                except Exception as e:
+                    logger.error(f"Error during per-paper incremental write check for {paper_id}: {e}")
+
                 return True
             except Exception as e:
                 logger.error(f"Failed to fetch citation for {paper_id}: {e}")
                 return False
         
         # Use ThreadPoolExecutor for parallel fetching
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        with ThreadPoolExecutor(max_workers=SEMANTIC_SCHOLAR_WORKERS) as executor:
             futures = {executor.submit(_fetch_single_paper_citations, pid): pid for pid in papers_needing_citations}
             
             try:
@@ -284,42 +295,72 @@ class ArxivScraper:
             cited_metadata = {}
         
         updated_count = 0
-        for paper_id in metadata.keys():
+
+        # If in-memory metadata is available, use it; otherwise scan data directory
+        if metadata:
+            paper_ids_iter = list(metadata.keys())
+        else:
+            # Scan paper folders under data_dir and derive paper_ids from metadata.json files
+            paper_ids_iter = []
+            try:
+                for folder_name in os.listdir(self.data_dir):
+                    paper_dir = os.path.join(self.data_dir, folder_name)
+                    if not os.path.isdir(paper_dir):
+                        continue
+                    metadata_file = os.path.join(paper_dir, 'metadata.json')
+                    if not os.path.exists(metadata_file):
+                        continue
+                    try:
+                        with open(metadata_file, 'r', encoding='utf-8') as mf:
+                            md = json.load(mf)
+                        # Prefer explicit arxiv_id in metadata, else try to infer from folder name
+                        pid = md.get('arxiv_id') or md.get('id')
+                        if not pid:
+                            pid = folder_name
+                        paper_ids_iter.append(pid)
+                    except Exception:
+                        continue
+            except Exception as e:
+                logger.error(f"Failed to scan data directory for papers: {e}")
+
+        for paper_id in paper_ids_iter:
             folder_name = format_folder_name(paper_id)
             paper_dir = os.path.join(self.data_dir, folder_name)
             metadata_file = os.path.join(paper_dir, 'metadata.json')
-            
+
             # Only create references.json if paper was successfully downloaded (has metadata.json)
             if not os.path.exists(metadata_file):
                 continue
-            
+
             if paper_id in citations:
                 self._save_references_for_paper(paper_id, paper_dir, citations[paper_id], cited_metadata)
                 updated_count += 1
         
         logger.info(f"Updated {updated_count} references.json files")
     
-    def fetch_cited_metadata(self, citations):
+    def fetch_cited_metadata(self, citations, metadata=None, batch_size: int = 100):
         """
-        Fetch metadata for cited papers using Kaggle dataset
-        
+        Fetch metadata for cited papers using arXiv API batch lookups
+
         Args:
             citations: Dictionary of citations from stage 2
-            
+            metadata: Optional metadata dict of main papers (used when calling update_references_json)
+            flush_batch_size: Number of cited paper metadata fetched before flushing cache and updating references.json
+
         Returns:
             dict: Dictionary mapping arxiv_id to metadata
         """
         logger.info("=" * 80)
-        logger.info("STAGE 1.3: Fetching metadata for cited papers")
+        logger.info("Stage 1.3: Fetching metadata for cited papers")
         logger.info("=" * 80)
         
         stage_start = time.time()
-        
+
         # Check if citations is valid
         if not citations:
             logger.warning("No citations available for Stage 1.3")
             return {}
-        
+
         # Check cache
         if os.path.exists(self.cited_dates_cache_file):
             logger.info(f"Loading cited paper dates from cache: {self.cited_dates_cache_file}")
@@ -327,33 +368,80 @@ class ArxivScraper:
                 cited_metadata = json.load(f)
                 logger.info(f"Loaded metadata for {len(cited_metadata)} cited papers from cache")
                 return cited_metadata
-        
-        # Check if Kaggle file exists
-        if not self.kaggle_handler.check_file_exists():
-            logger.warning("Skipping Stage 1.3: Kaggle metadata file not available")
-            logger.info("References will be saved without publication dates")
-            return {}
-        
-        # Extract all unique arXiv IDs from citations
-        all_arxiv_ids = set()
+
+        # Extract all unique arXiv IDs from citations (skip None/invalid entries)
+        all_arxiv_ids = []
+        seen = set()
         for paper_refs in citations.values():
+            if not paper_refs:
+                # Some cache entries may be None; skip gracefully
+                continue
             for ref in paper_refs:
-                if 'arxiv_id' in ref:
-                    all_arxiv_ids.add(ref['arxiv_id'])
-        
+                if not isinstance(ref, dict):
+                    continue
+                aid = ref.get('arxiv_id')
+                if aid and aid not in seen:
+                    seen.add(aid)
+                    all_arxiv_ids.append(aid)
+
         logger.info(f"Found {len(all_arxiv_ids)} unique arXiv IDs in citations")
-        
-        # Fetch metadata from Kaggle dataset
-        cited_metadata = self.kaggle_handler.load_metadata_for_ids(list(all_arxiv_ids))
-        
-        # Save to cache
-        with open(self.cited_dates_cache_file, 'w', encoding='utf-8') as f:
-            json.dump(cited_metadata, f, indent=2)
-        logger.info(f"Saved cited paper metadata cache to {self.cited_dates_cache_file}")
-        
+
+        cited_metadata = {}
+        total_fetched = 0
+
+        # Fetch in batches using arXiv API (max 100 per batch)
+        for i in range(0, len(all_arxiv_ids), 100):
+            batch = all_arxiv_ids[i:i+100]
+            try:
+                logger.info(f"Fetching arXiv metadata batch {i//100 + 1} ({len(batch)} ids)")
+                batch_meta = self.arxiv_client.get_batch_metadata(batch, batch_size=100)
+
+                # Merge and normalize
+                for aid, meta in batch_meta.items():
+                    if not meta:
+                        continue
+
+                    authors = self.arxiv_client.normalize_authors(meta.get('authors', []))
+
+                    entry = {
+                        'title': meta.get('title', ''),
+                        'authors': authors,
+                        'submission_date': meta.get('submission_date', '')
+                    }
+
+                    if aid not in cited_metadata:
+                        cited_metadata[aid] = entry
+                        total_fetched += 1
+
+                # After each API batch, flush whatever we've collected so far and update references
+                try:
+                    with open(self.cited_dates_cache_file, 'w', encoding='utf-8') as f:
+                        json.dump(cited_metadata, f, indent=2)
+                    logger.info(f"Flushed cited metadata cache after API batch {i//100 + 1}: {len(cited_metadata)} items")
+                except Exception as e:
+                    logger.error(f"Failed to flush cited metadata cache after API batch: {e}")
+
+                try:
+                    if metadata and citations:
+                        logger.info(f"Updating references.json after API batch {i//100 + 1}")
+                        self.update_references_json(metadata, citations, cited_metadata)
+                except Exception as e:
+                    logger.error(f"Error updating references.json after API batch: {e}")
+
+            except Exception as e:
+                logger.error(f"Failed to fetch arXiv batch metadata: {e}")
+
+        # Final save
+        try:
+            with open(self.cited_dates_cache_file, 'w', encoding='utf-8') as f:
+                json.dump(cited_metadata, f, indent=2)
+            logger.info(f"Saved cited paper metadata cache to {self.cited_dates_cache_file} ({len(cited_metadata)} items)")
+        except Exception as e:
+            logger.error(f"Failed to save final cited metadata cache: {e}")
+
         stage_time = time.time() - stage_start
         self.monitor.record_stage_time('Stage 1.3: Cited paper metadata', stage_time)
-        
+
         return cited_metadata
     
     def download_and_process(self, paper_ids, metadata=None, citations=None, cited_metadata=None):
@@ -367,7 +455,7 @@ class ArxivScraper:
             cited_metadata: Optional cited metadata dict
         """
         logger.info("=" * 80)
-        logger.info("STAGE 2: Downloading and processing source files")
+        logger.info("Stage 2: Downloading and processing source files")
         logger.info("=" * 80)
         
         stage_start = time.time()
@@ -491,13 +579,12 @@ class ArxivScraper:
                 tar_path = self.arxiv_client.download_source_version(version_id, self.cache_dir)
                 
                 if not tar_path or not os.path.exists(tar_path):
-                    # Version doesn't exist, we've reached the end
-                    if version == 1:
-                        logger.error(f"Failed to download even v1 for {paper_id}")
-                        return False
-                    else:
+                    # Version doesn't exist — we've reached the end.
+                    if downloaded_versions:
                         logger.info(f"Found {len(downloaded_versions)} version(s) for {paper_id}")
-                        break
+                    else:
+                        logger.info(f"No downloadable source found for {paper_id} (v1 missing)")
+                    break
                 
                 downloaded_versions.append((version, version_id, tar_path))
                 version += 1
@@ -531,7 +618,12 @@ class ArxivScraper:
                 version_tex_dir = os.path.join(tex_dir, f"{folder_name}v{version_num}")
                 
                 # Copy tex and bib files to version subdirectory (preserving structure and filenames)
-                self.file_processor.copy_tex_and_bib_files(version_temp_dir, version_tex_dir)
+                self.file_processor.copy_tex_and_bib_files(
+                    version_temp_dir,
+                    version_tex_dir,
+                    skip_large_bib=self.skip_large_bib,
+                    bib_size_threshold=self.bib_size_threshold
+                )
                 
                 # Cleanup version temp dir and tar file
                 self.file_processor.cleanup_temp_dir(version_temp_dir)
@@ -540,7 +632,11 @@ class ArxivScraper:
             
             # Check if at least one version was downloaded
             if not os.path.exists(tex_dir) or not os.listdir(tex_dir):
-                logger.error(f"Failed to download any version for {paper_id}")
+                logger.info(f"Skipping paper {paper_id}: no downloadable source (skipping by default)")
+                try:
+                    self.monitor.increment_stat('skipped_papers', 1)
+                except Exception:
+                    pass
                 return False
             
             # Fetch and save metadata if not provided
@@ -554,10 +650,44 @@ class ArxivScraper:
             metadata_output = os.path.join(paper_dir, 'metadata.json')
             with open(metadata_output, 'w', encoding='utf-8') as f:
                 json.dump(paper_metadata, f, indent=2)
+            # Record metadata file written
+            try:
+                self.monitor.incr_error('metadata_files_written', 1)
+            except Exception:
+                pass
             
-            # Save references.json if citations provided
-            if citations and paper_id in citations:
-                self._save_references_for_paper(paper_id, paper_dir, citations[paper_id], cited_metadata)
+            # Attempt to write references immediately after metadata is saved.
+            try:
+                citations_to_use = citations or {}
+                cited_meta_to_use = cited_metadata or {}
+
+                # Best-effort: load citations cache if we don't have in-memory citations
+                if not citations_to_use or paper_id not in citations_to_use:
+                    try:
+                        if os.path.exists(self.citations_cache_file):
+                            with open(self.citations_cache_file, 'r', encoding='utf-8') as cf:
+                                loaded_cits = json.load(cf) or {}
+                                if isinstance(loaded_cits, dict):
+                                    citations_to_use = loaded_cits
+                    except Exception:
+                        citations_to_use = citations_to_use or {}
+
+                # Best-effort: load cited metadata cache if absent
+                if not cited_meta_to_use:
+                    try:
+                        if os.path.exists(self.cited_dates_cache_file):
+                            with open(self.cited_dates_cache_file, 'r', encoding='utf-8') as df:
+                                loaded_cited = json.load(df) or {}
+                                if isinstance(loaded_cited, dict):
+                                    cited_meta_to_use = loaded_cited
+                    except Exception:
+                        cited_meta_to_use = cited_meta_to_use or {}
+
+                if citations_to_use and paper_id in citations_to_use:
+                    self._save_references_for_paper(paper_id, paper_dir, citations_to_use[paper_id], cited_meta_to_use)
+                    logger.info(f"Incremental references.json written for {paper_id} after metadata save")
+            except Exception as e:
+                logger.error(f"Failed to write incremental references for {paper_id}: {e}")
             
             logger.info(f"Successfully processed {paper_id} in {time.time() - paper_start:.2f}s")
             return True
@@ -584,29 +714,72 @@ class ArxivScraper:
                 ref_id = ref['arxiv_id']
                 ref_folder_name = format_folder_name(ref_id)
                 
-                # Get metadata from cited_metadata or use basic info
-                if cited_metadata and ref_id in cited_metadata:
-                    ref_meta = {
-                        'title': cited_metadata[ref_id].get('title', ''),
-                        'authors': self._normalize_authors(cited_metadata[ref_id].get('authors', [])),
-                        'submission_date': cited_metadata[ref_id].get('submission_date', ''),
-                        'semantic_scholar_id': ref.get('semantic_scholar_id', '')
-                    }
-                else:
-                    # Fallback to what we have from Semantic Scholar
-                    ref_meta = {
-                        'title': ref.get('title', ''),
-                        'authors': self._normalize_authors(ref.get('authors', [])),
-                        'submission_date': ref.get('publication_date', ''),
-                        'semantic_scholar_id': ref.get('semantic_scholar_id', '')
-                    }
+                # Build standardized ref metadata via arXiv client (prefer cited metadata)
+                cited_entry = cited_metadata.get(ref_id) if cited_metadata and ref_id in cited_metadata else None
+                ref_meta = self.arxiv_client.build_reference_metadata(ref, cited_entry=cited_entry)
                 
                 references_dict[ref_folder_name] = ref_meta
         
-        # Save references.json
+        # Save references.json (with change-detection to avoid unnecessary rewrites)
         ref_output = os.path.join(paper_dir, 'references.json')
-        with open(ref_output, 'w', encoding='utf-8') as f:
-            json.dump(references_dict, f, indent=2)
+        try:
+            # If a references file already exists, read and compare to avoid rewriting
+            should_write = True
+            if os.path.exists(ref_output):
+                try:
+                    with open(ref_output, 'r', encoding='utf-8') as rf:
+                        existing = json.load(rf)
+                    if existing == references_dict:
+                        should_write = False
+                except Exception:
+                    # If we can't read/parse existing file, proceed to overwrite
+                    should_write = True
+
+            if not should_write:
+                try:
+                    self.monitor.incr_error('references_files_skipped', 1)
+                except Exception:
+                    pass
+                logger.debug(f"SKIP writing references.json for {paper_id}: content unchanged")
+                return
+
+            # Write atomically to avoid partial files: write to temp then replace
+            tmp_output = ref_output + '.tmp'
+            with open(tmp_output, 'w', encoding='utf-8') as f:
+                json.dump(references_dict, f, indent=2)
+                try:
+                    f.flush()
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+
+            # Replace (atomic on most platforms)
+            try:
+                os.replace(tmp_output, ref_output)
+            except Exception:
+                # Fallback to rename
+                try:
+                    os.remove(ref_output)
+                except Exception:
+                    pass
+                os.rename(tmp_output, ref_output)
+
+            # Record references file written
+            try:
+                self.monitor.incr_error('references_files_written', 1)
+            except Exception:
+                pass
+
+            # Debug: log absolute path, existence, and size
+            try:
+                abs_path = os.path.abspath(ref_output)
+                exists = os.path.exists(abs_path)
+                size = os.path.getsize(abs_path) if exists else 0
+                logger.info(f"WROTE references.json -> {abs_path} (exists={exists}, size={size} bytes)")
+            except Exception as e:
+                logger.error(f"Failed to stat references.json after write: {e}")
+        except Exception as e:
+            logger.error(f"Failed to write references.json for {paper_id} at {ref_output}: {e}")
     
     def run(self):
         """Run the complete scraping pipeline with parallel stages"""
@@ -617,7 +790,6 @@ class ArxivScraper:
         self.monitor.start()
         
         try:
-            # Generate paper IDs
             paper_ids = self.generate_paper_ids()
             
             # Limit papers if in test mode
@@ -661,7 +833,7 @@ class ArxivScraper:
                     # After citations are fetched, fetch cited metadata
                     if citations:
                         logger.info("Stage 1.3: Fetching cited paper metadata...")
-                        cited_metadata = self.fetch_cited_metadata(citations)
+                        cited_metadata = self.fetch_cited_metadata(citations, metadata)
                     else:
                         logger.warning("No citations available, skipping Stage 1.3")
                         cited_metadata = {}
@@ -688,7 +860,6 @@ class ArxivScraper:
                 logger.error(f"Some stages failed: {stage_errors}")
             
             # Update references.json files with full citation data
-            # Only run if we have valid metadata and citations
             if metadata and citations:
                 logger.info("Updating references.json with citation metadata...")
                 self.update_references_json(metadata, citations, cited_metadata)
@@ -709,6 +880,14 @@ class ArxivScraper:
             self.monitor.stop()
             
             # Save performance report
+            try:
+                final_bytes = self.file_processor.get_directory_size(self.data_dir)
+                self.monitor.set_final_output_bytes(final_bytes)
+                # also update disk peak if larger
+                self.monitor.record_disk_peak(final_bytes)
+            except Exception:
+                final_bytes = 0
+
             report = self.monitor.get_summary_dict()
             report_file = os.path.join(self.data_dir, 'performance_report.json')
             with open(report_file, 'w', encoding='utf-8') as f:
@@ -717,18 +896,56 @@ class ArxivScraper:
 
 def main():
     """Main entry point"""
-    import sys
-    
-    if len(sys.argv) < 2:
-        print("Usage: python scraper.py <student_id> [max_papers]")
-        print("Example: python scraper.py 23127XXX")
-        print("Example (test mode): python scraper.py 23127XXX 3")
-        sys.exit(1)
-    
-    student_id = sys.argv[1]
-    max_papers = int(sys.argv[2]) if len(sys.argv) > 2 else None
-    
-    scraper = ArxivScraper(student_id, max_papers=max_papers)
+    parser = argparse.ArgumentParser(description='ArXiv scraper runner')
+    parser.add_argument('student_id', help='Student ID used for output folders')
+    parser.add_argument('max_papers', nargs='?', type=int, default=None, help='(Optional) limit number of papers (test mode)')
+    parser.add_argument('-p', '--paper', dest='paper_id', help='Process a single paper by arXiv id (e.g. 2402.10011)')
+    # By default we skip large .bib files; provide flag to disable that behavior
+    parser.set_defaults(skip_large_bib=True)
+    parser.add_argument('--no-skip-large-bib', dest='skip_large_bib', action='store_false', help='Do not skip copying .bib files larger than threshold')
+    parser.add_argument('--bib-threshold-mb', dest='bib_threshold_mb', type=float, default=5.0, help='Threshold in MB for skipping .bib files (default: 5)')
+
+    parser.set_defaults(skip_no_source=True)
+    args = parser.parse_args()
+
+    student_id = args.student_id
+    max_papers = args.max_papers
+
+    # Convert threshold MB to bytes
+    bib_threshold_bytes = int(args.bib_threshold_mb * 1024 * 1024)
+    scraper = ArxivScraper(student_id, max_papers=max_papers, skip_large_bib=args.skip_large_bib, bib_size_threshold=bib_threshold_bytes, skip_missing_source=args.skip_no_source)
+
+    if args.paper_id:
+        # Run single-paper processing (minimal run)
+        scraper.monitor.start()
+        try:
+            # Fetch citations for this single paper so references.json can be created
+            logger.info(f"Fetching citations for single paper {args.paper_id}")
+            citations = scraper.fetch_citations([args.paper_id])
+
+            # Fetch cited metadata (arXiv batch lookups / optional local cache) if we have citations
+            cited_metadata = {}
+            if citations and args.paper_id in citations:
+                cited_metadata = scraper.fetch_cited_metadata(citations, metadata={})
+
+            success = scraper._process_single_paper(args.paper_id, paper_metadata=None, citations=citations, cited_metadata=cited_metadata)
+            if not success:
+                logger.error(f"Single-paper processing failed for {args.paper_id}")
+                sys.exit(2)
+        except KeyboardInterrupt:
+            logger.warning("Single-paper run interrupted by user")
+            sys.exit(130)
+        finally:
+            scraper.monitor.stop()
+            # Save a minimal performance report
+            report = scraper.monitor.get_summary_dict()
+            report_file = os.path.join(scraper.data_dir, 'performance_report_single.json')
+            with open(report_file, 'w', encoding='utf-8') as f:
+                json.dump(report, f, indent=2)
+            logger.info(f"Performance report saved to {report_file}")
+
+        return
+
     scraper.run()
 
 if __name__ == '__main__':

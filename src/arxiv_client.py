@@ -13,9 +13,10 @@ logger = setup_logger(__name__)
 class ArxivClient:
     """Client for interacting with arXiv API"""
     
-    def __init__(self):
+    def __init__(self, monitor=None):
         self.client = arxiv.Client()
         self.last_request_time = 0
+        self.monitor = monitor
     
     def _rate_limit(self):
         """Apply rate limiting between API calls"""
@@ -23,6 +24,79 @@ class ArxivClient:
         if elapsed < ARXIV_API_DELAY:
             time.sleep(ARXIV_API_DELAY - elapsed)
         self.last_request_time = time.time()
+
+    def normalize_authors(self, authors):
+        """
+        Normalize various author representations into a list of strings.
+
+        Accepts:
+        - list of strings -> kept as-is
+        - list of [last, first, ...] -> converted to "First Last"
+        - list of dicts with 'name' -> uses that
+        - single string of authors separated by commas/semicolons -> split
+        """
+        if not authors:
+            return []
+
+        normalized = []
+        if isinstance(authors, str):
+            parts = [p.strip() for p in authors.replace(';', ',').split(',') if p.strip()]
+            return parts
+
+        for a in authors:
+            if isinstance(a, str):
+                if a.strip():
+                    normalized.append(a.strip())
+            elif isinstance(a, dict):
+                name = a.get('name') or a.get('author') or ''
+                if name:
+                    normalized.append(name.strip())
+            elif isinstance(a, (list, tuple)):
+                if len(a) >= 2:
+                    last = a[0].strip() if a[0] else ''
+                    first = a[1].strip() if a[1] else ''
+                    if first and last:
+                        normalized.append(f"{first} {last}")
+                    elif first:
+                        normalized.append(first)
+                    elif last:
+                        normalized.append(last)
+                elif len(a) == 1 and a[0]:
+                    normalized.append(str(a[0]).strip())
+
+        return normalized
+
+    def build_reference_metadata(self, ref, cited_entry=None):
+        """
+        Build a standardized reference metadata dict for `references.json`.
+
+        Args:
+            ref: Original reference dict from Semantic Scholar (may contain
+                 'title', 'authors', 'publication_date', 'semantic_scholar_id').
+            cited_entry: Optional arXiv-style cited metadata (from
+                         `get_batch_metadata`) which uses 'title', 'authors',
+                         'submission_date'. When present, it takes precedence.
+
+        Returns:
+            dict with keys: 'title', 'authors', 'submission_date', 'semantic_scholar_id'
+        """
+        if cited_entry:
+            title = cited_entry.get('title', '')
+            authors = self.normalize_authors(cited_entry.get('authors', []))
+            submission_date = cited_entry.get('submission_date', '')
+            ssid = ref.get('semantic_scholar_id', '')
+        else:
+            title = ref.get('title', '')
+            authors = self.normalize_authors(ref.get('authors', []))
+            submission_date = ref.get('publication_date', '')
+            ssid = ref.get('semantic_scholar_id', '')
+
+        return {
+            'title': title,
+            'authors': authors,
+            'submission_date': submission_date,
+            'semantic_scholar_id': ssid
+        }
     
     def get_batch_metadata(self, arxiv_ids, batch_size=100):
         """
@@ -46,15 +120,16 @@ class ArxivClient:
                 for attempt in range(MAX_RETRIES):
                     try:
                         self._rate_limit()
-                        
+
+                        start = time.time()
                         search = arxiv.Search(id_list=batch, max_results=batch_size)
-                        
+
                         for paper in self.client.results(search):
                             arxiv_id = paper.entry_id.split('/')[-1].split('v')[0]  # Extract ID
-                            
+
                             metadata = {
                                 'title': paper.title,
-                                'authors': [author.name for author in paper.authors],
+                                'authors': self.normalize_authors([author.name for author in paper.authors]),
                                 'submission_date': paper.published.isoformat(),
                                 'revised_dates': [],
                                 'journal_ref': paper.journal_ref
@@ -78,6 +153,14 @@ class ArxivClient:
                             
                             all_metadata[arxiv_id] = metadata
                         
+                        elapsed = time.time() - start
+                        if self.monitor:
+                            try:
+                                self.monitor.incr_http_requests(1)
+                                self.monitor.add_network_time(elapsed)
+                            except Exception:
+                                pass
+
                         logger.info(f"Successfully fetched {len(all_metadata)} papers")
                         break
                         
@@ -116,38 +199,47 @@ class ArxivClient:
         for attempt in range(MAX_RETRIES):
             try:
                 self._rate_limit()
-                
+
+                start = time.time()
                 search = arxiv.Search(id_list=[arxiv_id])
                 paper = next(self.client.results(search))
-                
+
                 # Extract metadata
                 metadata = {
                     'title': paper.title,
-                    'authors': [author.name for author in paper.authors],
+                    'authors': self.normalize_authors([author.name for author in paper.authors]),
                     'submission_date': paper.published.isoformat(),
                     'revised_dates': [],
                     'journal_ref': paper.journal_ref
                 }
-                
+
                 # Get version information
                 if hasattr(paper, '_raw') and 'arxiv:version' in paper._raw:
                     versions = paper._raw.get('arxiv:version', [])
                     if not isinstance(versions, list):
                         versions = [versions]
-                    
+
                     for version in versions:
                         created = version.get('created', '')
                         metadata['revised_dates'].append(created)
-                
+
                 # Fallback if version info not available
                 if not metadata['revised_dates']:
                     metadata['revised_dates'].append(paper.published.isoformat())
                     if paper.updated != paper.published:
                         metadata['revised_dates'].append(paper.updated.isoformat())
-                
+
+                elapsed = time.time() - start
+                if self.monitor:
+                    try:
+                        self.monitor.incr_http_requests(1)
+                        self.monitor.add_network_time(elapsed)
+                    except Exception:
+                        pass
+
                 logger.info(f"Successfully fetched metadata for {arxiv_id}")
                 return metadata
-                
+
             except StopIteration:
                 logger.error(f"Paper {arxiv_id} not found in arXiv")
                 return None
@@ -172,13 +264,18 @@ class ArxivClient:
         """
         for attempt in range(MAX_RETRIES):
             try:
-                self._rate_limit()
-                
                 search = arxiv.Search(id_list=[arxiv_id_with_version])
                 paper = next(self.client.results(search))
-                
+
                 filename = f"{arxiv_id_with_version.replace('.', '-')}.tar.gz"
+                start = time.time()
                 downloaded_path = paper.download_source(dirpath=save_dir, filename=filename)
+                elapsed = time.time() - start
+                if self.monitor:
+                    try:
+                        self.monitor.add_network_time(elapsed)
+                    except Exception:
+                        pass
                 
                 # Validate downloaded file
                 if downloaded_path and os.path.exists(downloaded_path):

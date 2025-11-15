@@ -10,9 +10,9 @@ logger = setup_logger(__name__)
 
 class FileProcessor:
     """Processor for arXiv source files"""
-    
-    def __init__(self):
-        pass
+
+    def __init__(self, monitor=None):
+        self.monitor = monitor
     
     def extract_tarball(self, tar_path, extract_dir):
         """
@@ -45,6 +45,11 @@ class FileProcessor:
             if os.path.exists(tar_path):
                 os.remove(tar_path)
                 logger.info(f"Deleted corrupted file: {tar_path}")
+            if self.monitor:
+                try:
+                    self.monitor.incr_error('extraction_failures', 1)
+                except Exception:
+                    pass
             return False
     
     def find_tex_files(self, directory):
@@ -115,14 +120,16 @@ class FileProcessor:
                     pass
         return total_size
     
-    def copy_tex_and_bib_files(self, source_dir, dest_dir):
+    def copy_tex_and_bib_files(self, source_dir, dest_dir, skip_large_bib=True, bib_size_threshold=5*1024*1024):
         """
         Copy all .tex and .bib files from source to destination, preserving directory structure
         
         Args:
             source_dir: Source directory
             dest_dir: Destination directory
-            
+            skip_large_bib: If True, skip copying .bib files larger than bib_size_threshold bytes
+            bib_size_threshold: size in bytes above which .bib files are skipped (default 5MB)
+
         Returns:
             int: Number of files copied
         """
@@ -136,6 +143,7 @@ class FileProcessor:
                     all_files.append(os.path.join(root, file))
         
         copied = 0
+        skipped_bib = 0
         for file_path in all_files:
             try:
                 # Preserve relative path from source_dir
@@ -144,12 +152,31 @@ class FileProcessor:
                 
                 # Create subdirectories if needed
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                
+
+                # Optionally skip large .bib files
+                if skip_large_bib and file_path.endswith('.bib'):
+                    try:
+                        size = os.path.getsize(file_path)
+                        if size > bib_size_threshold:
+                            skipped_bib += 1
+                            logger.info(f"Skipping large .bib file (> {bib_size_threshold} bytes): {file_path}")
+                            continue
+                    except Exception:
+                        # If size check fails, fall back to copying
+                        pass
+
                 shutil.copy2(file_path, dest_path)
                 copied += 1
             except Exception as e:
                 logger.warning(f"Failed to copy {file_path}: {e}")
         
+        if skipped_bib > 0:
+            logger.info(f"Skipped {skipped_bib} large .bib files")
+            if self.monitor:
+                try:
+                    self.monitor.incr_error('skipped_bib_count', skipped_bib)
+                except Exception:
+                    pass
         logger.info(f"Copied {copied} .tex and .bib files to {dest_dir}")
         return copied
     

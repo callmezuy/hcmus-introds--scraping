@@ -10,12 +10,13 @@ logger = setup_logger(__name__)
 
 class SemanticScholarClient:
     """Client for interacting with Semantic Scholar API"""
-    
-    def __init__(self, api_key=None):
+
+    def __init__(self, api_key=None, monitor=None):
         self.base_url = "https://api.semanticscholar.org/graph/v1"
         self.api_key = api_key
         self.last_request_time = 0
         self.headers = {}
+        self.monitor = monitor
         if api_key:
             self.headers['x-api-key'] = api_key
     
@@ -45,7 +46,15 @@ class SemanticScholarClient:
                     'fields': 'references,references.paperId,references.externalIds,references.title,references.authors,references.year,references.publicationDate'
                 }
                 
+                start = time.time()
                 response = requests.get(url, params=params, headers=self.headers, timeout=30)
+                elapsed = time.time() - start
+                if self.monitor:
+                    try:
+                        self.monitor.incr_http_requests(1)
+                        self.monitor.add_network_time(elapsed)
+                    except Exception:
+                        pass
                 
                 if response.status_code == 404:
                     logger.warning(f"Paper {arxiv_id} not found in Semantic Scholar")
@@ -53,6 +62,11 @@ class SemanticScholarClient:
                 
                 if response.status_code == 429:
                     logger.warning(f"Rate limit exceeded for {arxiv_id}, waiting...")
+                    if self.monitor:
+                        try:
+                            self.monitor.incr_http_429(1)
+                        except Exception:
+                            pass
                     time.sleep(RETRY_DELAY * 2)
                     continue
                 
@@ -83,6 +97,11 @@ class SemanticScholarClient:
                 
             except requests.exceptions.RequestException as e:
                 logger.warning(f"Attempt {attempt + 1}/{MAX_RETRIES} failed for {arxiv_id}: {e}")
+                if self.monitor:
+                    try:
+                        self.monitor.incr_http_retries(1)
+                    except Exception:
+                        pass
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(RETRY_DELAY)
                 else:

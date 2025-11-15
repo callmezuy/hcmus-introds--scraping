@@ -8,19 +8,19 @@ import os
 ARXIV_API_DELAY = 3.0  # seconds between API calls
 SEMANTIC_SCHOLAR_DELAY = 1.0
 MAX_RETRIES = 3
-RETRY_DELAY = 5.0
+RETRY_DELAY = 3.0
 
 # Paths
 DATA_DIR = os.path.join("..", "data")
 CACHE_DIR = os.path.join("..", "cache")
-KAGGLE_METADATA_PATH = os.path.join("..", "arxiv-metadata-oai-snapshot.json")
 
 # Logging
 LOG_FILE = "scraper.log"
 LOG_LEVEL = "INFO"
 
 # Threading
-MAX_WORKERS = 8  # For parallel downloads (4->8 = 2x faster, can go up to 16 if network is good)
+MAX_WORKERS = 16
+SEMANTIC_SCHOLAR_WORKERS = 4
 
 def get_assigned_range(student_id, csv_path="../TCTA-DS1.csv"):
     """
