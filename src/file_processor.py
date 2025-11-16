@@ -3,7 +3,11 @@ File processor for extracting and cleaning arXiv source files
 """
 import os
 import tarfile
+import zipfile
+import gzip
 import shutil
+from pathlib import Path
+from typing import BinaryIO, cast
 from logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -13,38 +17,124 @@ class FileProcessor:
 
     def __init__(self, monitor=None):
         self.monitor = monitor
-    
-    def extract_tarball(self, tar_path, extract_dir):
+
+    def extract_archive(self, archive_path, extract_dir):
         """
-        Extract tar.gz file
-        
+        Extract various archive/file types into `extract_dir`.
+
+        Supported types:
+        - tar.gz / .tar
+        - .zip
+        - single-file gzipped (.tex.gz, .bib.gz)
+        - plain .tex or .bib files (copied into extract_dir)
+
         Args:
-            tar_path: Path to .tar.gz file
+            archive_path: Path to downloaded file
             extract_dir: Directory to extract to
-            
+
         Returns:
-            bool: True if successful
+            bool: True if extraction/copy succeeded and extract_dir contains files
         """
         try:
-            # Validate it's a gzip file
-            if not tarfile.is_tarfile(tar_path):
-                logger.error(f"Not a valid tar file: {tar_path}")
-                # Delete invalid file
-                if os.path.exists(tar_path):
-                    os.remove(tar_path)
-                    logger.info(f"Deleted invalid file: {tar_path}")
-                return False
-            
-            with tarfile.open(tar_path, 'r:gz') as tar:
-                tar.extractall(path=extract_dir)
-            logger.info(f"Extracted {tar_path} to {extract_dir}")
-            return True
+            os.makedirs(extract_dir, exist_ok=True)
+
+            p = Path(archive_path)
+
+            # tar files
+            if tarfile.is_tarfile(archive_path):
+                with tarfile.open(archive_path, 'r:*') as tar:
+                    tar.extractall(path=extract_dir)
+                logger.info(f"Extracted tar archive {archive_path} to {extract_dir}")
+                return True
+
+            # zip files
+            if zipfile.is_zipfile(archive_path):
+                with zipfile.ZipFile(archive_path, 'r') as zf:
+                    zf.extractall(path=extract_dir)
+                logger.info(f"Extracted zip archive {archive_path} to {extract_dir}")
+                return True
+
+            # gzipped single file (.tex.gz or .bib.gz) or tar.gz
+            if p.suffix == '.gz':
+                # Read magic bytes to decide real content type
+                try:
+                    with open(archive_path, 'rb') as fh:
+                        magic = fh.read(8)
+                except Exception as e:
+                    logger.warning(f"Failed to read file header for {archive_path}: {e}")
+                    magic = b''
+
+                # PDF files sometimes get misnamed with .tar.gz; detect and copy as PDF
+                if magic.startswith(b'%PDF'):
+                    try:
+                        dest = os.path.join(extract_dir, p.name.replace('.tar.gz', '.pdf'))
+                        shutil.copy2(archive_path, dest)
+                        logger.info(f"Saved PDF (mislabelled) {archive_path} to {dest}")
+                        return True
+                    except Exception as e:
+                        logger.warning(f"Failed to copy mislabelled PDF {archive_path}: {e}")
+
+                # HTML/error pages
+                if magic.lstrip().startswith(b'<'):
+                    try:
+                        dest = os.path.join(extract_dir, p.name + '.html')
+                        shutil.copy2(archive_path, dest)
+                        logger.warning(f"Saved HTML/error page from {archive_path} to {dest}")
+                        return False
+                    except Exception as e:
+                        logger.warning(f"Failed to save HTML from {archive_path}: {e}")
+
+                # Check for gzip magic header (0x1f 0x8b)
+                if magic.startswith(b'\x1f\x8b'):
+                    try:
+                        # Decompress to a temporary path (remove .gz)
+                        decompressed_name = p.stem  # removes only last .gz
+                        decompressed_path = os.path.join(extract_dir, decompressed_name)
+                        with gzip.open(archive_path, 'rb') as f_in_raw, open(decompressed_path, 'wb') as f_out:
+                            f_in = cast(BinaryIO, f_in_raw)
+                            shutil.copyfileobj(f_in, f_out)
+                        # If decompressed result is a tar, extract it
+                        if tarfile.is_tarfile(decompressed_path):
+                            with tarfile.open(decompressed_path, 'r:*') as tar:
+                                tar.extractall(path=extract_dir)
+                            logger.info(f"Decompressed and extracted tar from {archive_path} to {extract_dir}")
+                            try:
+                                os.remove(decompressed_path)
+                            except Exception:
+                                pass
+                            return True
+                        else:
+                            # If not a tar, keep decompressed file (e.g., .tex.gz -> .tex)
+                            logger.info(f"Decompressed {archive_path} to {decompressed_path}")
+                            return True
+                    except Exception as e:
+                        logger.warning(f"Failed to decompress gz file {archive_path}: {e}")
+                else:
+                    # Not a gzip file despite .gz extension
+                    logger.warning(f"File {archive_path} has .gz extension but is not gzip; header={magic[:8]!r}")
+
+            # plain .tex or .bib files - copy into extract_dir
+            if p.suffix in {'.tex', '.bib'}:
+                try:
+                    dest = os.path.join(extract_dir, p.name)
+                    shutil.copy2(archive_path, dest)
+                    logger.info(f"Copied single source file {archive_path} to {dest}")
+                    return True
+                except Exception as e:
+                    logger.warning(f"Failed to copy single source file {archive_path}: {e}")
+
+            # Unknown/unsupported format: log and return False (caller may decide to keep/remove)
+            logger.warning(f"Unsupported archive/file type for extraction: {archive_path}")
+            return False
+
         except Exception as e:
-            logger.error(f"Failed to extract {tar_path}: {e}")
-            # Delete corrupted file
-            if os.path.exists(tar_path):
-                os.remove(tar_path)
-                logger.info(f"Deleted corrupted file: {tar_path}")
+            logger.error(f"Failed to extract {archive_path}: {e}")
+            if os.path.exists(archive_path):
+                try:
+                    os.remove(archive_path)
+                    logger.info(f"Deleted corrupted file: {archive_path}")
+                except Exception:
+                    pass
             if self.monitor:
                 try:
                     self.monitor.incr_error('extraction_failures', 1)

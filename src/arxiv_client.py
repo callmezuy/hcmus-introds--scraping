@@ -1,300 +1,245 @@
 """
-arXiv API client for fetching paper metadata
+Clean arXiv API client for fetching paper metadata and sources.
 """
-import arxiv
+
 import os
-import tarfile
 import time
-from config import ARXIV_API_DELAY, MAX_RETRIES, RETRY_DELAY
+import json
+import re
+import arxiv
+from datetime import datetime, timezone
+import unicodedata
+
+from config import ARXIV_API_DELAY, MAX_RETRIES, RETRY_DELAY, format_folder_name
 from logger import setup_logger
+
 
 logger = setup_logger(__name__)
 
+
 class ArxivClient:
-    """Client for interacting with arXiv API"""
-    
+    """Client for interacting with the arXiv API."""
+
     def __init__(self, monitor=None):
         self.client = arxiv.Client()
         self.last_request_time = 0
         self.monitor = monitor
-    
+
     def _rate_limit(self):
-        """Apply rate limiting between API calls"""
         elapsed = time.time() - self.last_request_time
         if elapsed < ARXIV_API_DELAY:
             time.sleep(ARXIV_API_DELAY - elapsed)
         self.last_request_time = time.time()
 
-    def normalize_authors(self, authors):
-        """
-        Normalize various author representations into a list of strings.
-
-        Accepts:
-        - list of strings -> kept as-is
-        - list of [last, first, ...] -> converted to "First Last"
-        - list of dicts with 'name' -> uses that
-        - single string of authors separated by commas/semicolons -> split
-        """
-        if not authors:
-            return []
-
-        normalized = []
-        if isinstance(authors, str):
-            parts = [p.strip() for p in authors.replace(';', ',').split(',') if p.strip()]
-            return parts
-
-        for a in authors:
-            if isinstance(a, str):
-                if a.strip():
-                    normalized.append(a.strip())
-            elif isinstance(a, dict):
-                name = a.get('name') or a.get('author') or ''
-                if name:
-                    normalized.append(name.strip())
-            elif isinstance(a, (list, tuple)):
-                if len(a) >= 2:
-                    last = a[0].strip() if a[0] else ''
-                    first = a[1].strip() if a[1] else ''
-                    if first and last:
-                        normalized.append(f"{first} {last}")
-                    elif first:
-                        normalized.append(first)
-                    elif last:
-                        normalized.append(last)
-                elif len(a) == 1 and a[0]:
-                    normalized.append(str(a[0]).strip())
-
-        return normalized
-
-    def build_reference_metadata(self, ref, cited_entry=None):
-        """
-        Build a standardized reference metadata dict for `references.json`.
-
-        Args:
-            ref: Original reference dict from Semantic Scholar (may contain
-                 'title', 'authors', 'publication_date', 'semantic_scholar_id').
-            cited_entry: Optional arXiv-style cited metadata (from
-                         `get_batch_metadata`) which uses 'title', 'authors',
-                         'submission_date'. When present, it takes precedence.
-
-        Returns:
-            dict with keys: 'title', 'authors', 'submission_date', 'semantic_scholar_id'
-        """
-        if cited_entry:
-            title = cited_entry.get('title', '')
-            authors = self.normalize_authors(cited_entry.get('authors', []))
-            submission_date = cited_entry.get('submission_date', '')
-            ssid = ref.get('semantic_scholar_id', '')
-        else:
-            title = ref.get('title', '')
-            authors = self.normalize_authors(ref.get('authors', []))
-            submission_date = ref.get('publication_date', '')
-            ssid = ref.get('semantic_scholar_id', '')
-
-        return {
-            'title': title,
-            'authors': authors,
-            'submission_date': submission_date,
-            'semantic_scholar_id': ssid
-        }
-    
     def get_batch_metadata(self, arxiv_ids, batch_size=100):
-        """
-        Get metadata for multiple papers at once
-        
-        Args:
-            arxiv_ids: List of arXiv IDs
-            batch_size: Number of papers per API call (max 100)
-            
-        Returns:
-            dict: Dictionary mapping arxiv_id to metadata
+        """Fetch metadata for many arXiv IDs in batches.
+
+        Returns a dict mapping arXiv id (without version) to metadata.
         """
         all_metadata = {}
-        
-        # Process in batches
-        try:
-            for i in range(0, len(arxiv_ids), batch_size):
-                batch = arxiv_ids[i:i+batch_size]
-                logger.info(f"Fetching batch {i//batch_size + 1}: {len(batch)} papers")
-            
-                for attempt in range(MAX_RETRIES):
-                    try:
-                        self._rate_limit()
 
-                        start = time.time()
-                        search = arxiv.Search(id_list=batch, max_results=batch_size)
+        for i in range(0, len(arxiv_ids), batch_size):
+            batch = arxiv_ids[i : i + batch_size]
+            logger.info(f"Fetching batch {i // batch_size + 1}: {len(batch)} papers")
 
-                        for paper in self.client.results(search):
-                            arxiv_id = paper.entry_id.split('/')[-1].split('v')[0]  # Extract ID
+            for attempt in range(MAX_RETRIES):
+                try:
+                    self._rate_limit()
 
-                            metadata = {
-                                'title': paper.title,
-                                'authors': self.normalize_authors([author.name for author in paper.authors]),
-                                'submission_date': paper.published.isoformat(),
-                                'revised_dates': [],
-                                'journal_ref': paper.journal_ref
-                            }
-                            
-                            # Get version information
-                            if hasattr(paper, '_raw') and 'arxiv:version' in paper._raw:
-                                versions = paper._raw.get('arxiv:version', [])
-                                if not isinstance(versions, list):
-                                    versions = [versions]
-                                
-                                for version in versions:
-                                    created = version.get('created', '')
-                                    metadata['revised_dates'].append(created)
-                            
-                            # Fallback if version info not available
-                            if not metadata['revised_dates']:
-                                metadata['revised_dates'].append(paper.published.isoformat())
-                                if paper.updated != paper.published:
-                                    metadata['revised_dates'].append(paper.updated.isoformat())
-                            
-                            all_metadata[arxiv_id] = metadata
-                        
-                        elapsed = time.time() - start
-                        if self.monitor:
+                    start = time.time()
+                    search = arxiv.Search(id_list=batch, max_results=len(batch))
+                    for paper in self.client.results(search):
+                        arxiv_id = paper.entry_id.split("/")[-1].split("v")[0]
+                        def _normalize_author(a):
+                            # Preserve raw author string from arXiv (minimal trimming only)
                             try:
-                                self.monitor.incr_http_requests(1)
-                                self.monitor.add_network_time(elapsed)
+                                name = a.name if hasattr(a, 'name') else str(a)
                             except Exception:
-                                pass
-
-                        logger.info(f"Successfully fetched {len(all_metadata)} papers")
-                        break
-                        
-                    except KeyboardInterrupt:
-                        logger.warning("Interrupted by user (Ctrl+C)")
-                        raise
-                    except Exception as e:
-                        logger.warning(f"Batch attempt {attempt + 1}/{MAX_RETRIES} failed: {e}")
-                        if attempt < MAX_RETRIES - 1:
-                            # Exponential backoff: wait longer each retry (especially for 429)
-                            wait_time = RETRY_DELAY * (2 ** attempt)
-                            logger.info(f"Waiting {wait_time}s before retry...")
+                                name = str(a)
                             try:
-                                time.sleep(wait_time)
-                            except KeyboardInterrupt:
-                                logger.warning("Interrupted during retry wait")
-                                raise
-                        else:
-                            logger.error(f"Failed to fetch batch after {MAX_RETRIES} attempts")
-        except KeyboardInterrupt:
-            logger.warning("Batch fetching interrupted")
-            raise
-        
+                                name = str(name).strip()
+                            except Exception:
+                                name = ''
+                            return name
+
+                        metadata = {
+                            "title": paper.title,
+                            "authors": [_normalize_author(author) for author in paper.authors],
+                            "submission_date": paper.published.isoformat(),
+                            "revised_dates": [],
+                            "journal_ref": paper.journal_ref,
+                        }
+                    
+                        revised_dates = []
+                        try:
+                            vers_attr = getattr(paper, 'versions', None)
+                            if vers_attr:
+                                for v in vers_attr:
+                                    # v may be dict-like or object with 'created'
+                                    created = None
+                                    try:
+                                        if isinstance(v, dict):
+                                            created = v.get('created') or v.get('date') or v.get('timestamp')
+                                        else:
+                                            created = getattr(v, 'created', None) or getattr(v, 'date', None)
+                                    except Exception:
+                                        created = None
+                                    if created:
+                                        # If datetime -> isoformat, else keep raw string
+                                        try:
+                                            if isinstance(created, datetime):
+                                                if created.tzinfo is None:
+                                                    created = created.replace(tzinfo=timezone.utc)
+                                                revised_dates.append(created.isoformat())
+                                            else:
+                                                revised_dates.append(str(created))
+                                        except Exception:
+                                            try:
+                                                revised_dates.append(str(created))
+                                            except Exception:
+                                                pass
+                        except Exception:
+                            pass
+
+                        # Deduplicate preserving order
+                        seen = set()
+                        deduped = []
+                        for d in revised_dates:
+                            if not d:
+                                continue
+                            if d not in seen:
+                                seen.add(d)
+                                deduped.append(d)
+
+                        metadata['revised_dates'] = deduped
+
+                        all_metadata[arxiv_id] = metadata
+
+                    elapsed = time.time() - start
+                    if self.monitor:
+                        try:
+                            self.monitor.incr_http_requests(1)
+                            self.monitor.add_network_time(elapsed)
+                        except Exception:
+                            pass
+
+                    break
+
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    logger.warning(f"Batch attempt {attempt + 1}/{MAX_RETRIES} failed: {e}")
+                    if attempt < MAX_RETRIES - 1:
+                        wait_time = RETRY_DELAY * (2 ** attempt)
+                        time.sleep(wait_time)
+                    else:
+                        logger.error(f"Failed to fetch batch after {MAX_RETRIES} attempts")
+
         return all_metadata
-    
+
     def get_paper_metadata(self, arxiv_id):
+        return self.get_batch_metadata([arxiv_id], batch_size=1)
+
+    def download_all_versions(self, arxiv_id, save_dir, max_versions=10):
+        """Download successive versions v1..vN for a base arXiv id.
+
+        Returns a list of tuples (downloaded_path, version_tag) for each successfully
+        downloaded version. Stops when a version is not found or when download fails.
         """
-        Get metadata for a paper including all versions
-        
-        Args:
-            arxiv_id: arXiv ID (e.g., "2310.12345")
-            
-        Returns:
-            dict: Paper metadata including title, authors, dates, versions
-        """
-        for attempt in range(MAX_RETRIES):
-            try:
-                self._rate_limit()
+        results = []
 
-                start = time.time()
-                search = arxiv.Search(id_list=[arxiv_id])
-                paper = next(self.client.results(search))
+        # Normalize base id (strip any vN suffix)
+        base = arxiv_id
+        m = re.match(r"^(?P<base>.+?)v(?P<num>\d+)$", arxiv_id)
+        if m:
+            base = m.group('base')
 
-                # Extract metadata
-                metadata = {
-                    'title': paper.title,
-                    'authors': self.normalize_authors([author.name for author in paper.authors]),
-                    'submission_date': paper.published.isoformat(),
-                    'revised_dates': [],
-                    'journal_ref': paper.journal_ref
-                }
+        try:
+            if save_dir:
+                try:
+                    os.makedirs(save_dir, exist_ok=True)
+                except Exception:
+                    pass
 
-                # Get version information
-                if hasattr(paper, '_raw') and 'arxiv:version' in paper._raw:
-                    versions = paper._raw.get('arxiv:version', [])
-                    if not isinstance(versions, list):
-                        versions = [versions]
+            for v in range(1, max_versions + 1):
+                id_with_version = f"{base}v{v}"
+                try:
+                    search = arxiv.Search(id_list=[id_with_version])
+                    paper = next(self.client.results(search))
+                except StopIteration:
+                    break
 
-                    for version in versions:
-                        created = version.get('created', '')
-                        metadata['revised_dates'].append(created)
-
-                # Fallback if version info not available
-                if not metadata['revised_dates']:
-                    metadata['revised_dates'].append(paper.published.isoformat())
-                    if paper.updated != paper.published:
-                        metadata['revised_dates'].append(paper.updated.isoformat())
-
-                elapsed = time.time() - start
-                if self.monitor:
+                try:
+                    version_tag = ""
                     try:
-                        self.monitor.incr_http_requests(1)
-                        self.monitor.add_network_time(elapsed)
+                        eid = paper.entry_id.split('/')[-1]
+                        if 'v' in eid:
+                            version_tag = 'v' + eid.split('v')[-1]
+                    except Exception:
+                        version_tag = f'v{v}'
+
+                    start = time.time()
+                    downloaded_path = paper.download_source(dirpath=save_dir)
+                    elapsed = time.time() - start
+                    if self.monitor:
+                        try:
+                            self.monitor.add_network_time(elapsed)
+                        except Exception:
+                            pass
+
+                    if downloaded_path and os.path.exists(downloaded_path):
+                        results.append((downloaded_path, version_tag))
+                    else:
+                        # If the download didn't produce a file, stop further attempts
+                        break
+                except Exception as e:
+                    logger.warning(f"Failed to download {id_with_version}: {e}")
+                    # Stop on first download error
+                    break
+
+        except Exception as e:
+            logger.error(f"Unexpected error while downloading versions for {arxiv_id}: {e}")
+
+        return results
+
+    def write_metadata_files(self, metadata_dict, data_dir):
+        """Write per-paper `metadata.json` files atomically."""
+        for pid, meta in (metadata_dict or {}).items():
+            try:
+                folder_name = format_folder_name(pid)
+                paper_dir = os.path.join(data_dir, folder_name)
+                os.makedirs(paper_dir, exist_ok=True)
+                meta_file = os.path.join(paper_dir, "metadata.json")
+                tmp_meta = meta_file + ".tmp"
+                try:
+                    with open(tmp_meta, "w", encoding="utf-8") as mf:
+                        # preserve unicode characters in author names
+                        json.dump(meta, mf, indent=2, ensure_ascii=False)
+                        try:
+                            mf.flush()
+                            os.fsync(mf.fileno())
+                        except Exception:
+                            pass
+
+                    try:
+                        os.replace(tmp_meta, meta_file)
+                    except Exception:
+                        try:
+                            if os.path.exists(meta_file):
+                                os.remove(meta_file)
+                        except Exception:
+                            pass
+                        os.rename(tmp_meta, meta_file)
+                    # Increment monitor counter for metadata files written
+                    try:
+                        if self.monitor:
+                            self.monitor.increment_stat('metadata_files_written')
                     except Exception:
                         pass
-
-                logger.info(f"Successfully fetched metadata for {arxiv_id}")
-                return metadata
-
-            except StopIteration:
-                logger.error(f"Paper {arxiv_id} not found in arXiv")
-                return None
-            except Exception as e:
-                logger.warning(f"Attempt {attempt + 1}/{MAX_RETRIES} failed for {arxiv_id}: {e}")
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(RETRY_DELAY)
-                else:
-                    logger.error(f"Failed to fetch metadata for {arxiv_id} after {MAX_RETRIES} attempts")
-                    return None
-    
-    def download_source_version(self, arxiv_id_with_version, save_dir):
-        """
-        Download source files for a specific version of a paper
-        
-        Args:
-            arxiv_id_with_version: arXiv ID with version (e.g., "2310.12345v1")
-            save_dir: Directory to save the source file
-            
-        Returns:
-            str: Path to downloaded file, or None if failed
-        """
-        for attempt in range(MAX_RETRIES):
-            try:
-                search = arxiv.Search(id_list=[arxiv_id_with_version])
-                paper = next(self.client.results(search))
-
-                filename = f"{arxiv_id_with_version.replace('.', '-')}.tar.gz"
-                start = time.time()
-                downloaded_path = paper.download_source(dirpath=save_dir, filename=filename)
-                elapsed = time.time() - start
-                if self.monitor:
-                    try:
-                        self.monitor.add_network_time(elapsed)
-                    except Exception:
-                        pass
-                
-                # Validate downloaded file
-                if downloaded_path and os.path.exists(downloaded_path):
-                    # Check if it's a valid tar.gz file
-                    if not tarfile.is_tarfile(downloaded_path):
-                        logger.error(f"Downloaded file is not a valid tar file: {arxiv_id_with_version}")
-                        os.remove(downloaded_path)
-                        return None
-                
-                logger.info(f"Successfully downloaded source for {arxiv_id_with_version}")
-                return downloaded_path
-                
-            except StopIteration:
-                logger.error(f"Paper {arxiv_id_with_version} not found for download")
-                return None
-            except Exception as e:
-                logger.warning(f"Download attempt {attempt + 1}/{MAX_RETRIES} failed for {arxiv_id_with_version}: {e}")
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(RETRY_DELAY)
-                else:
-                    logger.error(f"Failed to download source for {arxiv_id_with_version} after {MAX_RETRIES} attempts")
-                    return None
+                except Exception as e:
+                    logger.warning(f"Failed to write metadata.json for {pid}: {e}")
+            except Exception:
+                try:
+                    logger.warning(f"Unexpected error writing metadata for {pid}")
+                except Exception:
+                    pass

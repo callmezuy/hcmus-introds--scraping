@@ -24,7 +24,8 @@ def setup_logger(name=__name__):
     
     # Console handler
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
+    # Keep console output concise: show warnings and errors by default
+    console_handler.setLevel(logging.WARNING)
     console_format = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'

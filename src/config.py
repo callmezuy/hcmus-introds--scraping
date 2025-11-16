@@ -4,6 +4,8 @@ Configuration file for arXiv scraper
 import csv
 import os
 
+SEMANTIC_SCHOLAR_API_KEY = "9JcwvT4mJ39GR0cF7ntcB34Qg2pCJSS614DhOP2y"
+
 # API Rate Limits
 ARXIV_API_DELAY = 3.0  # seconds between API calls
 SEMANTIC_SCHOLAR_DELAY = 1.0

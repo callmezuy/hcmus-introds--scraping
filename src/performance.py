@@ -27,26 +27,12 @@ class PerformanceMonitor:
             'total_references': 0,
             'successful_references': 0,
             'failed_references': 0,
-            'total_size_bytes': 0,
-            'total_size_after_cleanup': 0,
             'stage_times': {},
             'stage_memory_peak': {},
-            'paper_times': [],
-            # network/http counters
-            'network_time_seconds': 0.0,
-            'http_requests': 0,
-            'http_429': 0,
-            'http_retries': 0,
-            # disk/counters
-            'disk_peak_bytes': 0,
-            'final_output_bytes': 0,
-            # errors and other counts
             'download_failures': 0,
             'extraction_failures': 0,
-            'skipped_papers': 0,
             'references_files_written': 0,
             'metadata_files_written': 0,
-            'skipped_bib_count': 0
         }
     
     def start(self):
@@ -65,7 +51,6 @@ class PerformanceMonitor:
     def record_stage_time(self, stage_name, duration):
         """Record time for a specific stage"""
         self.stats['stage_times'][stage_name] = duration
-        # sample memory for this stage end and record as stage peak approximation
         self.sample_memory()
         cur_mem = self.process.memory_info().rss / (1024 * 1024)
         prev = self.stats['stage_memory_peak'].get(stage_name, 0)
@@ -74,32 +59,18 @@ class PerformanceMonitor:
 
         logger.info(f"Stage '{stage_name}' completed in {duration:.2f} seconds; memory={cur_mem:.2f} MB")
 
-    def add_network_time(self, seconds: float):
-        self.stats['network_time_seconds'] += seconds
-
-    def incr_http_requests(self, count: int = 1):
-        self.stats['http_requests'] += count
-
-    def incr_http_429(self, count: int = 1):
-        self.stats['http_429'] += count
-
-    def incr_http_retries(self, count: int = 1):
-        self.stats['http_retries'] += count
 
     def record_disk_peak(self, bytes_used: int):
-        if bytes_used > self.stats.get('disk_peak_bytes', 0):
-            self.stats['disk_peak_bytes'] = bytes_used
+        # disk peak tracking removed; no-op
+        return
 
     def set_final_output_bytes(self, bytes_used: int):
-        self.stats['final_output_bytes'] = bytes_used
+        # final output size tracking removed; no-op
+        return
 
     def incr_error(self, key: str, count: int = 1):
         if key in self.stats:
             self.stats[key] += count
-    
-    def record_paper_time(self, paper_id, duration):
-        """Record time to process a single paper"""
-        self.stats['paper_times'].append(duration)
     
     def increment_stat(self, stat_name, value=1):
         """Increment a statistic"""
@@ -127,33 +98,8 @@ class PerformanceMonitor:
         logger.info(f"\nPaper Statistics:")
         logger.info(f"  Total papers: {self.stats['total_papers']}")
         logger.info(f"  Successful: {self.stats['successful_papers']}")
-        logger.info(f"  Failed: {self.stats['failed_papers']}")
-        # Optional: report skipped papers separately if present
-        if self.stats.get('skipped_papers', 0) > 0:
-            logger.info(f"  Skipped (no source): {self.stats.get('skipped_papers',0)}")
+        logger.info(f"  Failed (including skipped): {self.stats['failed_papers']}")
         logger.info(f"  Success rate: {success_rate:.2f}%")
-        
-        if self.stats['paper_times']:
-            avg_paper_time = sum(self.stats['paper_times']) / len(self.stats['paper_times'])
-            logger.info(f"  Average time per paper: {avg_paper_time:.2f} seconds")
-            # compute percentiles
-            times = sorted(self.stats['paper_times'])
-            def percentile(arr, p):
-                if not arr:
-                    return 0
-                k = (len(arr)-1) * (p/100.0)
-                f = int(k)
-                c = min(f+1, len(arr)-1)
-                if f == c:
-                    return arr[int(k)]
-                d0 = arr[f] * (c - k)
-                d1 = arr[c] * (k - f)
-                return d0 + d1
-
-            p50 = percentile(times, 50)
-            p90 = percentile(times, 90)
-            p95 = percentile(times, 95)
-            logger.info(f"  Paper time percentiles: p50={p50:.2f}s p90={p90:.2f}s p95={p95:.2f}s")
         
         # Reference statistics
         ref_success_rate = (self.stats['successful_references'] / self.stats['total_references'] * 100) if self.stats['total_references'] > 0 else 0
@@ -162,27 +108,10 @@ class PerformanceMonitor:
         logger.info(f"  Successful: {self.stats['successful_references']}")
         logger.info(f"  Failed: {self.stats['failed_references']}")
         logger.info(f"  Success rate: {ref_success_rate:.2f}%")
-        
+
         if self.stats['successful_papers'] > 0:
             avg_refs = self.stats['total_references'] / self.stats['successful_papers']
             logger.info(f"  Average references per paper: {avg_refs:.2f}")
-        
-        # Storage statistics
-        if self.stats['total_size_bytes'] > 0:
-            size_before_mb = self.stats['total_size_bytes'] / (1024 * 1024)
-            size_after_mb = self.stats['total_size_after_cleanup'] / (1024 * 1024)
-            reduction = ((self.stats['total_size_bytes'] - self.stats['total_size_after_cleanup']) / self.stats['total_size_bytes'] * 100)
-            
-            logger.info(f"\nStorage Statistics:")
-            logger.info(f"  Total size before cleanup: {size_before_mb:.2f} MB")
-            logger.info(f"  Total size after cleanup: {size_after_mb:.2f} MB")
-            logger.info(f"  Size reduction: {reduction:.2f}%")
-            
-            if self.stats['successful_papers'] > 0:
-                avg_size_before = size_before_mb / self.stats['successful_papers']
-                avg_size_after = size_after_mb / self.stats['successful_papers']
-                logger.info(f"  Average paper size before: {avg_size_before:.2f} MB")
-                logger.info(f"  Average paper size after: {avg_size_after:.2f} MB")
         
         # Stage times
         if self.stats['stage_times']:
@@ -195,35 +124,111 @@ class PerformanceMonitor:
                 logger.info("\nStage Memory Peaks (MB):")
                 for stage, mem in self.stats['stage_memory_peak'].items():
                     logger.info(f"  {stage}: {mem:.2f} MB")
-
-        # Network and http counters
-        if self.stats.get('http_requests', 0) > 0:
-            logger.info("\nNetwork / HTTP Summary:")
-            logger.info(f"  HTTP requests: {self.stats.get('http_requests',0)}")
-            logger.info(f"  HTTP 429 events: {self.stats.get('http_429',0)}")
-            logger.info(f"  HTTP retries: {self.stats.get('http_retries',0)}")
-            logger.info(f"  Network time (s): {self.stats.get('network_time_seconds',0.0):.2f}")
-
-        # Disk summary
-        if self.stats.get('disk_peak_bytes', 0) > 0 or self.stats.get('final_output_bytes', 0) > 0:
-            logger.info("\nDisk / Storage Summary:")
-            logger.info(f"  Peak disk usage (bytes): {self.stats.get('disk_peak_bytes',0)}")
-            logger.info(f"  Final output bytes: {self.stats.get('final_output_bytes',0)}")
         
         logger.info("=" * 80)
         
-        return self.stats
+        # Return a flattened summary (merge statistics into top-level)
+        return self.get_summary_dict()
     
     def get_summary_dict(self):
         """Get performance summary as dictionary"""
         total_time = (self.end_time - self.start_time) if self.end_time else 0
         avg_memory = sum(self.memory_samples) / len(self.memory_samples) if self.memory_samples else 0
-        
-        return {
+        summary = {
             'total_time_seconds': total_time,
             'total_time_minutes': total_time / 60,
             'initial_memory_mb': self.initial_memory,
             'peak_memory_mb': self.peak_memory,
             'average_memory_mb': avg_memory,
-            'statistics': self.stats
         }
+        # Merge in collected stats at top-level (no nested 'statistics' key)
+        summary.update(self.stats)
+        return summary
+
+    def compute_stats_from_data_dir(self, data_dir_path: str):
+        """Recompute several counters from on-disk files under `data_dir_path`.
+
+        This scans per-paper folders and updates statistics such as:
+        - total_papers
+        - metadata_files_written
+        - references_files_written
+        - total_references
+
+        It is safe to call this before `stop()` so that logged summaries reflect
+        the actual files on disk rather than incremental counters that may
+        have been missed during parallel execution.
+        """
+        import os, json
+        from pathlib import Path
+
+        data_dir = Path(data_dir_path)
+        if not data_dir.exists() or not data_dir.is_dir():
+            return
+
+        paper_dirs = [d for d in data_dir.iterdir() if d.is_dir()]
+
+        total_papers = len(paper_dirs)
+        metadata_files = 0
+        references_files = 0
+        total_references = 0
+        papers_with_source = 0
+        papers_no_arxiv_refs = 0
+
+        for p in paper_dirs:
+            if (p / 'metadata.json').exists():
+                metadata_files += 1
+            if (p / 'references.json').exists():
+                references_files += 1
+                try:
+                    with open(p / 'references.json', 'r', encoding='utf-8') as rf:
+                        refs = json.load(rf)
+                        if isinstance(refs, dict):
+                            total_references += len(refs)
+                except Exception:
+                    pass
+
+            # Count papers that have no arXiv-cited references
+            try:
+                if (p / 'references.json').exists():
+                    with open(p / 'references.json', 'r', encoding='utf-8') as rf:
+                        refs_check = json.load(rf)
+                        if isinstance(refs_check, dict):
+                            keys = [k for k in refs_check.keys() if not k.startswith('_')]
+                            if len(keys) == 0:
+                                papers_no_arxiv_refs += 1
+            except Exception:
+                pass
+
+            # detect source presence under `tex/` (any .tex or other non-placeholder file)
+            tex_dir = p / 'tex'
+            has_source = False
+            if tex_dir.exists():
+                for root, dirs, files in os.walk(tex_dir):
+                    for fn in files:
+                        if fn.lower().endswith('.tex'):
+                            has_source = True
+                            break
+                        if fn != 'NO_SOURCE_AVAILABLE.txt':
+                            has_source = True
+                            break
+                    if has_source:
+                        break
+            if has_source:
+                papers_with_source += 1
+
+        skipped_papers = total_papers - papers_with_source
+
+        # Update stats
+        self.stats['total_papers'] = total_papers
+        failed_existing = self.stats.get('failed_papers', 0)
+        failed_total = failed_existing + skipped_papers + papers_no_arxiv_refs
+        self.stats['failed_papers'] = failed_total
+        successful = max(0, total_papers - failed_total)
+        self.stats['successful_papers'] = successful
+        self.stats['metadata_files_written'] = metadata_files
+        self.stats['references_files_written'] = references_files
+        runtime_total = self.stats.get('successful_references', 0) + self.stats.get('failed_references', 0)
+        if runtime_total > 0:
+            self.stats['total_references'] = runtime_total
+        else:
+            self.stats['total_references'] = total_references
