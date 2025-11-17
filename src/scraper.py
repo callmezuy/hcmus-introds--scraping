@@ -12,13 +12,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import (
     get_assigned_range, format_arxiv_id, format_folder_name,
-    DATA_DIR, CACHE_DIR, MAX_WORKERS, SEMANTIC_SCHOLAR_WORKERS, SEMANTIC_SCHOLAR_API_KEY
+    DATA_DIR, CACHE_DIR, MAX_WORKERS, SEMANTIC_SCHOLAR_WORKERS, SEMANTIC_SCHOLAR_API_KEY, KAGGLE_DATASET_PATH
 )
 from logger import setup_logger
 from performance import PerformanceMonitor
 from arxiv_client import ArxivClient
 from semantic_scholar_client import SemanticScholarClient
 from file_processor import FileProcessor
+from kaggle_client import KaggleArxivClient
 
 logger = setup_logger(__name__)
 
@@ -38,6 +39,8 @@ class ArxivScraper:
         # Monitor should be created before clients/processors that may use it
         self.monitor = PerformanceMonitor()
         self.arxiv_client = ArxivClient(monitor=self.monitor)
+        root_snapshot = os.path.normpath(os.path.join(os.path.dirname(__file__), KAGGLE_DATASET_PATH))
+        self.kaggle_client = KaggleArxivClient(root_snapshot)
         self.semantic_scholar_client = SemanticScholarClient(api_key=SEMANTIC_SCHOLAR_API_KEY, monitor=self.monitor)
         self.file_processor = FileProcessor(monitor=self.monitor)
         # Options for skipping large .bib files when copying
@@ -59,8 +62,36 @@ class ArxivScraper:
         # Cache files
         self.metadata_cache_file = os.path.join(self.cache_dir, f"{self.student_id}_metadata.json")
         self.references_cache_file = os.path.join(self.cache_dir, f"{self.student_id}_references.json")
+        self.download_cache_file = os.path.join(self.cache_dir, f"{self.student_id}_downloaded.json")
+        self.download_cache_lock = threading.Lock()
+        try:
+            with open(self.download_cache_file, 'r', encoding='utf-8') as f:
+                self.download_cache = json.load(f) or {}
+        except Exception:
+            self.download_cache = {}
         # Behavior: whether to skip papers that have no downloadable source
         self.skip_missing_source = skip_missing_source
+
+    def _is_version_downloaded(self, paper_id, version_tag):
+        if not version_tag:
+            return False
+        try:
+            return paper_id in self.download_cache and version_tag in (self.download_cache.get(paper_id) or [])
+        except Exception:
+            return False
+
+    def _mark_version_downloaded(self, paper_id, version_tag):
+        if not version_tag:
+            return
+        with self.download_cache_lock:
+            lst = self.download_cache.setdefault(paper_id, [])
+            if version_tag not in lst:
+                lst.append(version_tag)
+                try:
+                    with open(self.download_cache_file, 'w', encoding='utf-8') as f:
+                        json.dump(self.download_cache, f, indent=2, ensure_ascii=False)
+                except Exception:
+                    pass
     
     def generate_paper_ids(self):
         """
@@ -140,7 +171,17 @@ class ArxivScraper:
             batch = remaining_papers[i:i+batch_size]
             logger.info(f"Fetching batch {i//batch_size + 1}/{(len(remaining_papers)-1)//batch_size + 1}")
             
-            batch_metadata = self.arxiv_client.get_batch_metadata(batch, batch_size=batch_size)
+            # Use Kaggle snapshot for metadata, fall back to arXiv API if snapshot missing
+            try:
+                snapshot_path = getattr(self.kaggle_client, 'snapshot_path', None)
+                if snapshot_path and os.path.exists(snapshot_path):
+                    batch_metadata = self.kaggle_client.get_batch_metadata(batch)
+                else:
+                    logger.warning(f"Kaggle snapshot not found at {snapshot_path!s}; falling back to arXiv API for metadata")
+                    batch_metadata = self.arxiv_client.get_batch_metadata(batch, batch_size=batch_size)
+            except Exception:
+                # Final fallback to arXiv API client if anything goes wrong
+                batch_metadata = self.arxiv_client.get_batch_metadata(batch, batch_size=batch_size)
             metadata.update(batch_metadata)
             
             # Save cache after each batch
@@ -276,7 +317,6 @@ class ArxivScraper:
         logger.info(f"Completed fetching references for {len(references)} papers")
         return references
     
-
     def download_and_process(self, paper_ids):
         """
         Download and process source files for papers
@@ -307,33 +347,17 @@ class ArxivScraper:
             os.makedirs(paper_dir, exist_ok=True)
 
             temp_dir = os.path.join(paper_dir, 'tmp_download')
+            start_proc = time.time()
             try:
                 # Download all available versions sequentially (v1..vN)
-                downloads = self.arxiv_client.download_all_versions(pid, save_dir=temp_dir, max_versions=20)
-
-                if not downloads:
-                    logger.warning(f"No source versions downloaded for {pid}")
-                    # Create placeholder versioned folder with marker
-                    try:
-                        versioned_subfolder = pid
-                        versioned_folder_name = format_folder_name(versioned_subfolder)
-                        dest_tex_dir = os.path.join(paper_dir, 'tex', versioned_folder_name)
-                        os.makedirs(dest_tex_dir, exist_ok=True)
-                        marker = os.path.join(dest_tex_dir, 'NO_SOURCE_AVAILABLE.txt')
-                        with open(marker, 'w', encoding='utf-8') as mf:
-                            mf.write('Full source archive not available from arXiv for this paper.\n')
-                        logger.info(f"Created placeholder tex folder for {pid} at {dest_tex_dir}")
-                    except Exception:
-                        logger.warning(f"Failed to create placeholder tex folder for {pid}")
-
-                    if self.skip_missing_source:
-                        return 'skipped'
-                    else:
-                        return False
+                # Provide the list of versions we've already processed for this paper
+                skip_versions = self.download_cache.get(pid, []) if hasattr(self, 'download_cache') else []
+                downloads = self.arxiv_client.download_all_versions(pid, save_dir=temp_dir, max_versions=20, skip_versions=skip_versions)
 
                 # For each downloaded version, extract and copy files into versioned subfolder
                 for downloaded, version_tag in downloads:
                     extract_dir = None
+                    copied = 0
                     try:
                         extract_dir = os.path.join(temp_dir, f'extracted_{version_tag or "nov"}')
                         extracted_ok = self.file_processor.extract_archive(downloaded, extract_dir)
@@ -355,6 +379,15 @@ class ArxivScraper:
                         except Exception:
                             pass
 
+                        # If we copied files for this version, record it in the central cache
+                        try:
+                            if copied and version_tag:
+                                try:
+                                    self._mark_version_downloaded(pid, version_tag)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
                     finally:
                         try:
                             self.file_processor.cleanup_temp_dir(extract_dir)
@@ -363,6 +396,16 @@ class ArxivScraper:
 
                 return True
             finally:
+                # record processing duration for this paper (download+extract+copy)
+                try:
+                    elapsed = time.time() - start_proc
+                    if hasattr(self.monitor, 'record_paper_stage_duration'):
+                        try:
+                            self.monitor.record_paper_stage_duration(pid, 'processing', elapsed)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 try:
                     self.file_processor.cleanup_temp_dir(temp_dir)
                 except Exception:
@@ -386,6 +429,15 @@ class ArxivScraper:
                                 self.monitor.increment_stat('skipped_papers')
                             else:
                                 self.monitor.increment_stat('failed_papers')
+                            # Update disk peak after each paper processed so peak reflects runtime
+                            try:
+                                current_bytes = self.file_processor.get_directory_size(self.data_dir)
+                                try:
+                                    self.monitor.record_disk_peak(current_bytes)
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
                     except Exception as e:
                         logger.error(f"Error processing {pid}: {e}")
                         try:
@@ -433,11 +485,11 @@ class ArxivScraper:
             def stage1_metadata():
                 start = time.time()
                 try:
-                    logger.info("Stage 1.1: Fetching metadata...")
+                    logger.info("Stage 1: Fetching metadata...")
                     nonlocal metadata
                     metadata = self.fetch_metadata(paper_ids)
                 except Exception as e:
-                    logger.error(f"Stage 1.1 failed: {e}")
+                    logger.error(f"Stage 1 failed: {e}")
                     stage_errors.append(('metadata', e))
                 finally:
                     try:
@@ -472,7 +524,6 @@ class ArxivScraper:
                         pass
             
             # Launch all 3 stages in parallel (Stage 1.3 runs inside Stage 1.2 thread)
-            import threading
             threads = [
                 threading.Thread(target=stage1_metadata, name="Stage-Metadata"),
                 threading.Thread(target=stage2_download, name="Stage-Download"),
@@ -531,17 +582,70 @@ class ArxivScraper:
             except Exception:
                 pass
 
-            # Save performance report
+            # Save performance report (simple write into configured cache directory)
             report = self.monitor.get_summary_dict()
-            report_file = os.path.join(self.data_dir, 'performance_report.json')
-            with open(report_file, 'w', encoding='utf-8') as f:
-                json.dump(report, f, indent=2)
-            logger.info(f"Performance report saved to {report_file}")
+            try:
+                os.makedirs(self.cache_dir, exist_ok=True)
+            except Exception:
+                pass
+            report_file = os.path.join(self.cache_dir, 'performance_report.json')
+            try:
+                with open(report_file, 'w', encoding='utf-8') as f:
+                    json.dump(report, f, indent=2, ensure_ascii=False)
+                logger.info(f"Performance report saved to {report_file}")
+            except Exception as e:
+                logger.error(f"Failed to write performance report to {report_file}: {e}")
 
     def process_single_paper(self, paper_id):
-        """Helper to process a single paper by delegating to download_and_process."""
+        """Process a single paper through all three stages"""
         try:
-            self.download_and_process([paper_id])
+            folder_name = format_folder_name(paper_id)
+            paper_dir = os.path.join(self.data_dir, folder_name)
+            os.makedirs(paper_dir, exist_ok=True)
+
+            # ---------- Stage 1: Metadata ----------
+            metadata_path = os.path.join(paper_dir, 'metadata.json')
+            if not os.path.exists(metadata_path):
+                try:
+                    # Try Kaggle snapshot first
+                    batch_md = {}
+                    snapshot_path = getattr(self.kaggle_client, 'snapshot_path', None)
+                    if snapshot_path and os.path.exists(snapshot_path):
+                        batch_md = self.kaggle_client.get_batch_metadata([paper_id]) or {}
+                    if not batch_md:
+                        batch_md = self.arxiv_client.get_batch_metadata([paper_id], batch_size=1) or {}
+
+                    if batch_md:
+                        # Write metadata atomically using ArxivClient
+                        try:
+                            self.arxiv_client.write_metadata_files(batch_md, self.data_dir)
+                            logger.info(f"Wrote metadata.json for {paper_id}")
+                        except Exception as e:
+                            logger.warning(f"Failed to write metadata.json for {paper_id}: {e}")
+                    else:
+                        logger.warning(f"No metadata found for {paper_id}")
+                except Exception as e:
+                    logger.error(f"Error fetching metadata for {paper_id}: {e}")
+
+            # ---------- Stage 2: Download & Process ----------
+            try:
+                self.download_and_process([paper_id])
+            except Exception as e:
+                logger.error(f"Error downloading/processing {paper_id}: {e}")
+
+            # ---------- Stage 3: References ----------
+            try:
+                # Fetch from Semantic Scholar and write per-paper references.json
+                refs = self.semantic_scholar_client.get_paper_references(paper_id)
+                try:
+                    written = self.semantic_scholar_client.write_references_json(paper_id, paper_dir)
+                    if written:
+                        logger.info(f"Wrote references.json for {paper_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to write references.json for {paper_id}: {e}")
+            except Exception as e:
+                logger.error(f"Failed to fetch references for {paper_id}: {e}")
+
             return True
         except Exception as e:
             logger.error(f"_process_single_paper failed for {paper_id}: {e}")
@@ -569,13 +673,9 @@ def main():
     scraper = ArxivScraper(student_id, max_papers=max_papers, skip_large_bib=args.skip_large_bib, bib_size_threshold=bib_threshold_bytes, skip_missing_source=args.skip_no_source)
 
     if args.paper_id:
-        # Run single-paper processing (minimal run)
-        scraper.monitor.start()
         try:
             # Fetch references for this single paper so references.json can be created
             logger.info(f"Fetching references for single paper {args.paper_id}")
-            citations = scraper.fetch_references([args.paper_id])
-            cited_metadata = {}
 
             success = scraper.process_single_paper(args.paper_id)
             if not success:
@@ -584,14 +684,6 @@ def main():
         except KeyboardInterrupt:
             logger.warning("Single-paper run interrupted by user")
             sys.exit(130)
-        finally:
-            scraper.monitor.stop()
-            # Save a minimal performance report
-            report = scraper.monitor.get_summary_dict()
-            report_file = os.path.join(scraper.data_dir, 'performance_report_single.json')
-            with open(report_file, 'w', encoding='utf-8') as f:
-                json.dump(report, f, indent=2)
-            logger.info(f"Performance report saved to {report_file}")
 
         return
 

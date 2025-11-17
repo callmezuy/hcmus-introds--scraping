@@ -3,7 +3,7 @@ Logging utilities for the arXiv scraper
 """
 import logging
 import sys
-from config import LOG_FILE, LOG_LEVEL
+from config import LOG_FILE
 
 def setup_logger(name=__name__):
     """
@@ -16,16 +16,15 @@ def setup_logger(name=__name__):
         logging.Logger: Configured logger
     """
     logger = logging.getLogger(name)
-    logger.setLevel(getattr(logging, LOG_LEVEL))
+    logger.setLevel(logging.DEBUG)
     
     # Avoid adding handlers multiple times
     if logger.handlers:
         return logger
     
-    # Console handler
+    # Console handler (show all logs)
     console_handler = logging.StreamHandler(sys.stdout)
-    # Keep console output concise: show warnings and errors by default
-    console_handler.setLevel(logging.WARNING)
+    console_handler.setLevel(logging.DEBUG)
     console_format = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'

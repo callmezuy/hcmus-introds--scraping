@@ -75,7 +75,7 @@ class SemanticScholarClient:
                             self.monitor.incr_http_429(1)
                         except Exception:
                             pass
-                    time.sleep(RETRY_DELAY * (2 ** attempt))
+                    time.sleep(RETRY_DELAY)
                     continue
 
                 response.raise_for_status()
@@ -113,9 +113,6 @@ class SemanticScholarClient:
                     title = ref.get('title', '') or ''
                     submission_date = ref.get('publicationDate') or ''
 
-                    # Determine a stable key for the reference:
-                    # Prefer arXiv (cleaned without version), then Semantic Scholar paperId,
-                    # then DOI, otherwise a short hash of title+authors.
                     stable_key = None
                     original_id = ''
 
@@ -187,6 +184,7 @@ class SemanticScholarClient:
         """
 
         try:
+            start = time.time()
             refs = self.get_paper_references(paper_id) or {}
             references_dict = {}
             skipped_non_arxiv = 0
@@ -238,6 +236,16 @@ class SemanticScholarClient:
                 try:
                     if self.monitor:
                         self.monitor.increment_stat('references_files_written')
+                        try:
+                            # record time spent in references stage (fetch+write)
+                            elapsed = time.time() - start
+                            if hasattr(self.monitor, 'record_paper_stage_duration'):
+                                try:
+                                    self.monitor.record_paper_stage_duration(paper_id, 'references', elapsed)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 return True

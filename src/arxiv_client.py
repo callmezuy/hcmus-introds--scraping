@@ -7,8 +7,6 @@ import time
 import json
 import re
 import arxiv
-from datetime import datetime, timezone
-import unicodedata
 
 from config import ARXIV_API_DELAY, MAX_RETRIES, RETRY_DELAY, format_folder_name
 from logger import setup_logger
@@ -71,35 +69,30 @@ class ArxivClient:
                         }
                     
                         revised_dates = []
+
+                        # Prefer reading raw arXiv version blocks when available
                         try:
-                            vers_attr = getattr(paper, 'versions', None)
-                            if vers_attr:
-                                for v in vers_attr:
-                                    # v may be dict-like or object with 'created'
-                                    created = None
+                            raw = getattr(paper, '_raw', None)
+                            if raw and isinstance(raw, dict) and 'arxiv:version' in raw:
+                                versions = raw.get('arxiv:version') or []
+                                if not isinstance(versions, list):
+                                    versions = [versions]
+
+                                for version in versions:
                                     try:
-                                        if isinstance(v, dict):
-                                            created = v.get('created') or v.get('date') or v.get('timestamp')
-                                        else:
-                                            created = getattr(v, 'created', None) or getattr(v, 'date', None)
+                                        created = version.get('created', '') if isinstance(version, dict) else ''
+                                        if created:
+                                            revised_dates.append(str(created))
                                     except Exception:
-                                        created = None
-                                    if created:
-                                        # If datetime -> isoformat, else keep raw string
-                                        try:
-                                            if isinstance(created, datetime):
-                                                if created.tzinfo is None:
-                                                    created = created.replace(tzinfo=timezone.utc)
-                                                revised_dates.append(created.isoformat())
-                                            else:
-                                                revised_dates.append(str(created))
-                                        except Exception:
-                                            try:
-                                                revised_dates.append(str(created))
-                                            except Exception:
-                                                pass
+                                        continue
                         except Exception:
                             pass
+
+                        # fallback
+                        if not revised_dates:
+                            revised_dates.append(paper.published.isoformat())
+                            if getattr(paper, 'updated', None) and paper.updated != paper.published:
+                                revised_dates.append(paper.updated.isoformat())
 
                         # Deduplicate preserving order
                         seen = set()
@@ -140,7 +133,7 @@ class ArxivClient:
     def get_paper_metadata(self, arxiv_id):
         return self.get_batch_metadata([arxiv_id], batch_size=1)
 
-    def download_all_versions(self, arxiv_id, save_dir, max_versions=10):
+    def download_all_versions(self, arxiv_id, save_dir, max_versions=10, skip_versions=None):
         """Download successive versions v1..vN for a base arXiv id.
 
         Returns a list of tuples (downloaded_path, version_tag) for each successfully
@@ -178,6 +171,19 @@ class ArxivClient:
                     except Exception:
                         version_tag = f'v{v}'
 
+                    # If caller supplied skip_versions, skip downloading this version
+                    try:
+                        if skip_versions and version_tag and version_tag in skip_versions:
+                            logger.info(f"Skipping download for {id_with_version}; listed in skip_versions")
+                            if self.monitor:
+                                try:
+                                    self.monitor.increment_stat('skipped_versions')
+                                except Exception:
+                                    pass
+                            continue
+                    except Exception:
+                        pass
+
                     start = time.time()
                     downloaded_path = paper.download_source(dirpath=save_dir)
                     elapsed = time.time() - start
@@ -211,6 +217,7 @@ class ArxivClient:
                 os.makedirs(paper_dir, exist_ok=True)
                 meta_file = os.path.join(paper_dir, "metadata.json")
                 tmp_meta = meta_file + ".tmp"
+                start = time.time()
                 try:
                     with open(tmp_meta, "w", encoding="utf-8") as mf:
                         # preserve unicode characters in author names
@@ -234,6 +241,13 @@ class ArxivClient:
                     try:
                         if self.monitor:
                             self.monitor.increment_stat('metadata_files_written')
+                            try:
+                                # record duration for metadata write stage
+                                elapsed = time.time() - start
+                                if hasattr(self.monitor, 'record_paper_stage_duration'):
+                                    self.monitor.record_paper_stage_duration(pid, 'metadata', elapsed)
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                 except Exception as e:

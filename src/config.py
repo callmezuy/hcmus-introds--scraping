@@ -5,12 +5,13 @@ import csv
 import os
 
 SEMANTIC_SCHOLAR_API_KEY = "9JcwvT4mJ39GR0cF7ntcB34Qg2pCJSS614DhOP2y"
+KAGGLE_DATASET_PATH = "../dataset/arxiv-metadata-oai-snapshot.json"
 
 # API Rate Limits
-ARXIV_API_DELAY = 3.0  # seconds between API calls
+ARXIV_API_DELAY = 3.0
 SEMANTIC_SCHOLAR_DELAY = 1.0
 MAX_RETRIES = 3
-RETRY_DELAY = 3.0
+RETRY_DELAY = 2.0
 
 # Paths
 DATA_DIR = os.path.join("..", "data")
