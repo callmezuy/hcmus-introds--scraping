@@ -70,11 +70,15 @@ KAGGLE_DATASET_PATH = "dataset/arxiv-metadata-oai-snapshot.json"
 Most runtime tuning is performed in `src/config.py`. Important variables:
 
 - `KAGGLE_DATASET_PATH` — path to local arXiv snapshot JSON (string). If None or invalid, the code falls back to arXiv API calls.
+- `CSV_PATH` — path to the student assignment CSV used to look up assigned arXiv ID ranges (default: `"../TCTA-DS1.csv"`).
 - `ARXIV_API_DELAY` — seconds to wait between arXiv API calls (float). Increase to be conservative with the arXiv service.
 - `SEMANTIC_SCHOLAR_DELAY` — minimum seconds between Semantic Scholar API calls (float). Default is 1.0 to respect rate limits.
 - `SEMANTIC_SCHOLAR_WORKERS` — number of concurrent workers for Semantic Scholar stage (int).
 - `MAX_WORKERS` — number of concurrent download/extract workers for Stage 2 (int).
 - `MAX_RETRIES` and `RETRY_DELAY` — controls retry/backoff on transient errors.
+
+Notes:
+- Ensure the CSV file `TCTA-DS1.csv` appears in the repository root or update `CSV_PATH` in `src/config.py` to point to its actual location. Expected CSV header: `MSSV,start_month,start_id,end_month,end_id`.
 
 Example configuration snippet (edit `src/config.py`):
 

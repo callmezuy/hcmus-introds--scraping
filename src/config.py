@@ -6,6 +6,7 @@ import os
 
 SEMANTIC_SCHOLAR_API_KEY = "9JcwvT4mJ39GR0cF7ntcB34Qg2pCJSS614DhOP2y"
 KAGGLE_DATASET_PATH = "../dataset/arxiv-metadata-oai-snapshot.json"
+CSV_PATH = "../TCTA-DS1.csv"
 
 # API Rate Limits
 ARXIV_API_DELAY = 3.0
@@ -25,7 +26,7 @@ LOG_LEVEL = "INFO"
 MAX_WORKERS = 16
 SEMANTIC_SCHOLAR_WORKERS = 4
 
-def get_assigned_range(student_id, csv_path="../TCTA-DS1.csv"):
+def get_assigned_range(student_id, csv_path=CSV_PATH):
     """
     Get the assigned arXiv paper range for a student ID
     
