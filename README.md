@@ -11,7 +11,6 @@ Project: a resilient, resumable pipeline that collects arXiv metadata, downloads
 - Configuration (quick reference)
 - Usage examples (single paper, batch, test)
 - Output layout and resumability
-- Troubleshooting & tips
 
 ---
 
