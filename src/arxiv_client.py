@@ -6,7 +6,7 @@ import os
 import time
 import json
 import re
-import arxiv
+import arxiv # type: ignore
 
 from config import ARXIV_API_DELAY, MAX_RETRIES, RETRY_DELAY, format_folder_name
 from logger import setup_logger
@@ -48,8 +48,7 @@ class ArxivClient:
                     search = arxiv.Search(id_list=batch, max_results=len(batch))
                     for paper in self.client.results(search):
                         arxiv_id = paper.entry_id.split("/")[-1].split("v")[0]
-                        def _normalize_author(a):
-                            # Preserve raw author string from arXiv (minimal trimming only)
+                        def normalize_author(a):
                             try:
                                 name = a.name if hasattr(a, 'name') else str(a)
                             except Exception:
@@ -62,7 +61,7 @@ class ArxivClient:
 
                         metadata = {
                             "title": paper.title,
-                            "authors": [_normalize_author(author) for author in paper.authors],
+                            "authors": [normalize_author(author) for author in paper.authors],
                             "submission_date": paper.published.isoformat(),
                             "revised_dates": [],
                             "journal_ref": paper.journal_ref,
@@ -141,7 +140,7 @@ class ArxivClient:
         """
         results = []
 
-        # Normalize base id (strip any vN suffix)
+        # Normalize base id
         base = arxiv_id
         m = re.match(r"^(?P<base>.+?)v(?P<num>\d+)$", arxiv_id)
         if m:
@@ -196,11 +195,9 @@ class ArxivClient:
                     if downloaded_path and os.path.exists(downloaded_path):
                         results.append((downloaded_path, version_tag))
                     else:
-                        # If the download didn't produce a file, stop further attempts
                         break
                 except Exception as e:
                     logger.warning(f"Failed to download {id_with_version}: {e}")
-                    # Stop on first download error
                     break
 
         except Exception as e:
@@ -220,7 +217,6 @@ class ArxivClient:
                 start = time.time()
                 try:
                     with open(tmp_meta, "w", encoding="utf-8") as mf:
-                        # preserve unicode characters in author names
                         json.dump(meta, mf, indent=2, ensure_ascii=False)
                         try:
                             mf.flush()

@@ -38,8 +38,7 @@ class FileProcessor:
 
             p = Path(archive_path)
 
-            # Only attempt extraction for tar or zip archives. Do not try to
-            # heuristically read magic bytes or handle mislabelled files here.
+            # Only attempt extraction for tar or zip archives.
             if tarfile.is_tarfile(archive_path):
                 with tarfile.open(archive_path, 'r:*') as tar:
                     tar.extractall(path=extract_dir)
@@ -52,7 +51,7 @@ class FileProcessor:
                 logger.info(f"Extracted zip archive {archive_path} to {extract_dir}")
                 return True
 
-            # plain .tex or .bib files - copy into extract_dir
+            # Plain .tex or .bib files - copy into extract_dir
             if p.suffix in {'.tex', '.bib'}:
                 try:
                     dest = os.path.join(extract_dir, p.name)
@@ -62,7 +61,6 @@ class FileProcessor:
                 except Exception as e:
                     logger.warning(f"Failed to copy single source file {archive_path}: {e}")
 
-            # Unknown/unsupported format: log and return False
             logger.warning(f"Unsupported archive/file type for extraction: {archive_path}")
             return False
 
@@ -191,7 +189,6 @@ class FileProcessor:
                             logger.info(f"Skipping large .bib file (> {bib_size_threshold} bytes): {file_path}")
                             continue
                     except Exception:
-                        # If size check fails, fall back to copying
                         pass
 
                 shutil.copy2(file_path, dest_path)

@@ -95,7 +95,7 @@ class SemanticScholarClient:
                         arxiv_ext = external_ids.get('ArXiv') or external_ids.get('arXiv')
                         doi_ext = external_ids.get('DOI') or external_ids.get('doi')
 
-                    # Normalize authors (preserve raw strings, trimmed)
+                    # Normalize authors
                     authors = []
                     for a in ref.get('authors', []) or []:
                         name = ''
@@ -152,11 +152,10 @@ class SemanticScholarClient:
                         'external_ids': external_ids or {}
                     }
 
-                    # Use the stable key (string) as the dictionary key
+                    # Use the stable key as the dictionary key
                     try:
                         references_dict[str(stable_key)] = entry
                     except Exception:
-                        # As a last resort, skip malformed refs
                         continue
 
                 logger.info(f"Fetched {len(references_dict)} references (including non-arXiv) for {arxiv_id}")
@@ -194,7 +193,6 @@ class SemanticScholarClient:
             for aid, meta in refs.items():
                 try:
                     if isinstance(aid, str) and arxiv_re.match(aid):
-                        # Convert dot to dash in keys to match existing format (yymm-id)
                         key = aid.replace('.', '-')
                         entry = {
                             'title': meta.get('title', ''),
@@ -206,7 +204,6 @@ class SemanticScholarClient:
                     else:
                         skipped_non_arxiv += 1
                 except Exception:
-                    # Skip malformed entries
                     continue
 
             os.makedirs(paper_dir, exist_ok=True)
@@ -237,7 +234,7 @@ class SemanticScholarClient:
                     if self.monitor:
                         self.monitor.increment_stat('references_files_written')
                         try:
-                            # record time spent in references stage (fetch+write)
+                            # Record time spent in references stage)
                             elapsed = time.time() - start
                             if hasattr(self.monitor, 'record_paper_stage_duration'):
                                 try:

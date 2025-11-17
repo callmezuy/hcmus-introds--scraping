@@ -18,11 +18,10 @@ def setup_logger(name=__name__):
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
     
-    # Avoid adding handlers multiple times
     if logger.handlers:
         return logger
     
-    # Console handler (show all logs)
+    # Console handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.DEBUG)
     console_format = logging.Formatter(

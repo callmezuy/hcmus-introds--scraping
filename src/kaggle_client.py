@@ -8,11 +8,9 @@ from email.utils import parsedate_to_datetime
 class KaggleArxivClient:
     def __init__(self, snapshot_path: str):
         self.snapshot_path = str(snapshot_path)
-        # simple in-memory cache for lookups
         self._cache = {}
 
-    def _normalize_id(self, arxiv_id: str) -> str:
-        # remove version suffix if present
+    def normalize_id(self, arxiv_id: str) -> str:
         if arxiv_id is None:
             return ''
         s = str(arxiv_id).strip()
@@ -20,7 +18,7 @@ class KaggleArxivClient:
             return s.split('v')[0]
         return s
 
-    def _parse_date(self, date_str: str) -> str:
+    def parse_date(self, date_str: str) -> str:
         """Parse a date string like 'Mon, 2 Apr 2007 19:18:42 GMT' to ISO format.
 
         If parsing fails, return the original string.
@@ -32,12 +30,11 @@ class KaggleArxivClient:
             return dt.isoformat()
         except Exception:
             try:
-                # Some entries might already be ISO-like
                 return str(date_str)
             except Exception:
                 return ''
 
-    def _build_metadata_from_record(self, record: Dict) -> Dict:
+    def build_metadata_from_record(self, record: Dict) -> Dict:
         # Some files wrap content under 'root'
         if isinstance(record, dict) and 'root' in record:
             rec = record.get('root') or {}
@@ -69,7 +66,6 @@ class KaggleArxivClient:
                 for a in [x.strip() for x in raw.split(',') if x.strip()]:
                     authors.append(a)
 
-        # versions -> list of {version, created}
         revised_dates = []
         try:
             versions = rec.get('versions') or []
@@ -79,21 +75,13 @@ class KaggleArxivClient:
                 if isinstance(v, dict):
                     created = v.get('created') or ''
                     if created:
-                        iso = self._parse_date(created)
+                        iso = self.parse_date(created)
                         if iso:
                             revised_dates.append(iso)
                         else:
                             revised_dates.append(str(created))
         except Exception:
             pass
-
-        # Fallback to update_date / other fields if versions missing
-        if not revised_dates:
-            ud = rec.get('update_date') or rec.get('updated') or ''
-            if ud:
-                rd = self._parse_date(ud)
-                if rd:
-                    revised_dates.append(rd)
 
         submission_date = revised_dates[0] if revised_dates else ''
 
@@ -113,9 +101,9 @@ class KaggleArxivClient:
         This streams the snapshot file and returns the first match. If no match,
         returns an empty dict.
         """
-        target = self._normalize_id(arxiv_id)
+        target = self.normalize_id(arxiv_id)
 
-        # Check cache first
+        # Check cache
         if target in self._cache:
             return self._cache[target]
 
@@ -139,10 +127,9 @@ class KaggleArxivClient:
                     rid = rec.get('id') if isinstance(rec, dict) else None
                     if not rid:
                         continue
-                    rid_norm = self._normalize_id(rid)
+                    rid_norm = self.normalize_id(rid)
                     if rid_norm == target:
-                        md = self._build_metadata_from_record(rec)
-                        # cache small results
+                        md = self.build_metadata_from_record(rec) # type: ignore
                         try:
                             self._cache[target] = md
                         except Exception:
@@ -154,17 +141,17 @@ class KaggleArxivClient:
         return {}
 
     def get_batch_metadata(self, arxiv_ids: List[str]) -> Dict[str, Dict]:
-        targets = {self._normalize_id(a) for a in (arxiv_ids or [])}
+        targets = {self.normalize_id(a) for a in (arxiv_ids or [])}
         out = {}
 
         p = Path(self.snapshot_path)
         if not p.exists():
-            # fallback to per-id lookups (which will return {})
+            # fallback to per-id lookups
             for aid in arxiv_ids:
                 try:
                     m = self.get_paper_metadata(aid)
                     if m:
-                        out[self._normalize_id(aid)] = m
+                        out[self.normalize_id(aid)] = m
                 except Exception:
                     continue
             return out
@@ -186,11 +173,10 @@ class KaggleArxivClient:
                     rid = rec.get('id') if isinstance(rec, dict) else None
                     if not rid:
                         continue
-                    rid_norm = self._normalize_id(rid)
+                    rid_norm = self.normalize_id(rid)
                     if rid_norm in targets:
-                        md = self._build_metadata_from_record(rec)
+                        md = self.build_metadata_from_record(rec) # type: ignore
                         out[rid_norm] = md
-                        # cache
                         try:
                             self._cache[rid_norm] = md
                         except Exception:
@@ -202,7 +188,7 @@ class KaggleArxivClient:
                 try:
                     m = self.get_paper_metadata(aid)
                     if m:
-                        out[self._normalize_id(aid)] = m
+                        out[self.normalize_id(aid)] = m
                 except Exception:
                     continue
 

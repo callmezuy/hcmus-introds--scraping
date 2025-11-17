@@ -69,7 +69,6 @@ class ArxivScraper:
                 self.download_cache = json.load(f) or {}
         except Exception:
             self.download_cache = {}
-        # Behavior: whether to skip papers that have no downloadable source
         self.skip_missing_source = skip_missing_source
 
     def mark_version_downloaded(self, paper_id, version_tag):
@@ -105,12 +104,11 @@ class ArxivScraper:
         
         current_year = start_year
         current_mon = start_mon
-        current_id = start_id
         
         while (current_year < end_year) or (current_year == end_year and current_mon <= end_mon):
             month_str = f"{current_year}-{current_mon:02d}"
             
-            # Determine the range for this month
+            # Determine the range
             if current_year == start_year and current_mon == start_mon:
                 id_start = start_id
             else:
@@ -122,15 +120,10 @@ class ArxivScraper:
                 # Use a large number for months in between
                 id_end = 99999
             
-            # Generate IDs for this month
+            # Generate IDs
             for paper_id in range(id_start, id_end + 1):
                 arxiv_id = format_arxiv_id(month_str, paper_id)
                 paper_ids.append(arxiv_id)
-                
-                # Safety check - don't generate too many
-                if len(paper_ids) > 10000:
-                    logger.warning("Generated over 10000 IDs, stopping")
-                    return paper_ids
             
             # Move to next month
             current_mon += 1
@@ -172,7 +165,6 @@ class ArxivScraper:
                     logger.warning(f"Kaggle snapshot not found at {snapshot_path!s}; falling back to arXiv API for metadata")
                     batch_metadata = self.arxiv_client.get_batch_metadata(batch, batch_size=batch_size)
             except Exception:
-                # Final fallback to arXiv API client if anything goes wrong
                 batch_metadata = self.arxiv_client.get_batch_metadata(batch, batch_size=batch_size)
             metadata.update(batch_metadata)
             
@@ -180,7 +172,7 @@ class ArxivScraper:
             with open(self.metadata_cache_file, 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, indent=2)
             logger.info(f"Progress saved: {len(metadata)}/{len(paper_ids)} papers")
-            # Also write per-paper metadata.json files so metadata stage is independent
+            # Write per-paper metadata.json files
             try:
                 self.arxiv_client.write_metadata_files(batch_metadata, self.data_dir)
             except Exception as e:
@@ -224,9 +216,8 @@ class ArxivScraper:
                 with refs_lock:
                     references[pid] = refs
                     completed[0] += 1
-                    # monitor stats
                     try:
-                        # Count how many returned references have arXiv IDs (we only write those)
+                        # Count how many returned references have arXiv IDs
                         arxiv_re = re.compile(r'^\d{4}\.\d+')
                         arxiv_count = 0
                         non_arxiv_count = 0
@@ -252,11 +243,10 @@ class ArxivScraper:
                         except Exception as e:
                             logger.error(f"Failed to save references cache: {e}")
 
-                # Write per-paper references.json using SemanticScholarClient helper
+                # Write per-paper references.json
                 try:
                     folder_name = format_folder_name(pid)
                     paper_dir = os.path.join(self.data_dir, folder_name)
-                    # Delegate actual writing to the semantic client helper
                     try:
                         written = self.semantic_scholar_client.write_references_json(pid, paper_dir)
                         if written:
@@ -281,7 +271,6 @@ class ArxivScraper:
                         pid = futures[fut]
                         try:
                             ok = fut.result()
-                            # if fetch returned False, count as failed reference fetch
                             if ok is False:
                                 try:
                                     self.monitor.increment_stat('failed_references')
@@ -325,7 +314,6 @@ class ArxivScraper:
         
         stage_start = time.time()
 
-        # Decide which papers to download: for independence, process all provided IDs
         papers_to_process = list(paper_ids)
 
         logger.info(f"Downloading and processing {len(papers_to_process)} papers using {MAX_WORKERS} threads")
@@ -341,12 +329,10 @@ class ArxivScraper:
             temp_dir = os.path.join(paper_dir, 'tmp_download')
             start_proc = time.time()
             try:
-                # Download all available versions sequentially (v1..vN)
-                # Provide the list of versions we've already processed for this paper
+                # Download all available versions sequentially
                 skip_versions = self.download_cache.get(pid, []) if hasattr(self, 'download_cache') else []
                 downloads = self.arxiv_client.download_all_versions(pid, save_dir=temp_dir, max_versions=20, skip_versions=skip_versions)
 
-                # For each downloaded version, extract and copy files into versioned subfolder
                 for downloaded, version_tag in downloads:
                     extract_dir = None
                     copied = 0
@@ -357,7 +343,7 @@ class ArxivScraper:
                             logger.warning(f"Extraction failed for {pid} {version_tag}, keeping downloaded file for inspection")
 
                         try:
-                            # Record size before removing figures (if monitor available)
+                            # Record size before removing figures
                             size_before = 0
                             size_after = 0
                             if extract_dir and os.path.exists(extract_dir):
@@ -376,7 +362,7 @@ class ArxivScraper:
                             logger.warning(f"Failed to copy tex/bib for {pid} {version_tag}: {e}")
 
                         try:
-                            # Remove figures from the extracted tree (saves space)
+                            # Remove figures from the extracted tree
                             files_removed, bytes_saved = self.file_processor.remove_figures(extract_dir)
                             try:
                                 if extract_dir and os.path.exists(extract_dir):
@@ -384,11 +370,10 @@ class ArxivScraper:
                             except Exception:
                                 size_after = 0
 
-                            # Record per-paper sizes (before/after) in the performance monitor
+                            # Record per-paper sizes
                             try:
                                 if hasattr(self, 'monitor') and getattr(self, 'monitor', None) is not None and hasattr(self.monitor, 'record_paper_sizes'):
-                                    # Use pid with version tag only for per-version granularity if desired; here we store per-paper (pid)
-                                    self.monitor.record_paper_sizes(pid, size_before, size_after)
+                                    self.monitor.record_paper_sizes(pid, size_before, size_after) # type: ignore
                             except Exception:
                                 pass
                         except Exception:
@@ -411,7 +396,7 @@ class ArxivScraper:
 
                 return True
             finally:
-                # record processing duration for this paper (download+extract+copy)
+                # Record processing duration for this paper
                 try:
                     elapsed = time.time() - start_proc
                     if hasattr(self.monitor, 'record_paper_stage_duration'):
@@ -526,9 +511,6 @@ class ArxivScraper:
                 try:
                     logger.info("Stage 3: Fetching references...")
                     references = self.fetch_references(paper_ids)
-                    # We don't currently have a fetch_cited_metadata implementation here;
-                    # leave cited_metadata empty (the semantic client writes per-paper references.json).
-                    cited_metadata = {}
                 except Exception as e:
                     logger.error(f"Stage 3 failed: {e}")
                     stage_errors.append(('references', e))
@@ -538,7 +520,6 @@ class ArxivScraper:
                     except Exception:
                         pass
             
-            # Launch all 3 stages in parallel (Stage 1.3 runs inside Stage 1.2 thread)
             threads = [
                 threading.Thread(target=stage1_metadata, name="Stage-Metadata"),
                 threading.Thread(target=stage2_download, name="Stage-Download"),
@@ -548,14 +529,12 @@ class ArxivScraper:
             for thread in threads:
                 thread.start()
             
-            # Wait for all stages to complete
             for thread in threads:
                 thread.join()
-            # After all stages complete
+
             if stage_errors:
                 logger.error(f"Some stages failed: {stage_errors}")
 
-            # Metadata and references should have been written by their respective stages
             if metadata and references:
                 logger.info("Metadata and references fetched; per-paper files should be present.")
             else:
@@ -572,32 +551,29 @@ class ArxivScraper:
             logger.error(f"Fatal error during scraping: {e}", exc_info=True)
         
         finally:
-            # Recompute on-disk stats so the monitor reflects actual files produced
+            # Recompute on-disk stats
             try:
                 final_bytes = self.file_processor.get_directory_size(self.data_dir)
             except Exception:
                 final_bytes = 0
 
             try:
-                # Update monitor counters from the data directory before stopping
                 self.monitor.compute_stats_from_data_dir(self.data_dir)
             except Exception:
                 pass
 
             try:
                 self.monitor.set_final_output_bytes(final_bytes)
-                # also update disk peak if larger
                 self.monitor.record_disk_peak(final_bytes)
             except Exception:
                 pass
 
-            # Stop monitor (will log summary using updated counters)
             try:
                 self.monitor.stop()
             except Exception:
                 pass
 
-            # Save performance report (simple write into configured cache directory)
+            # Save performance report
             report = self.monitor.get_summary_dict()
             try:
                 os.makedirs(self.cache_dir, exist_ok=True)
@@ -650,7 +626,6 @@ class ArxivScraper:
 
             # ---------- Stage 3: References ----------
             try:
-                # Fetch from Semantic Scholar and write per-paper references.json
                 refs = self.semantic_scholar_client.get_paper_references(paper_id)
                 try:
                     written = self.semantic_scholar_client.write_references_json(paper_id, paper_dir)
@@ -672,7 +647,7 @@ def main():
     parser.add_argument('student_id', help='Student ID used for output folders')
     parser.add_argument('max_papers', nargs='?', type=int, default=None, help='(Optional) limit number of papers (test mode)')
     parser.add_argument('-p', '--paper', dest='paper_id', help='Process a single paper by arXiv id (e.g. 2402.10011)')
-    # By default we skip large .bib files; provide flag to disable that behavior
+    # By default, skip large .bib files; provide flag to disable that behavior
     parser.set_defaults(skip_large_bib=True)
     parser.add_argument('--no-skip-large-bib', dest='skip_large_bib', action='store_false', help='Do not skip copying .bib files larger than threshold')
     parser.add_argument('--bib-threshold-mb', dest='bib_threshold_mb', type=float, default=5.0, help='Threshold in MB for skipping .bib files (default: 5)')
@@ -683,13 +658,11 @@ def main():
     student_id = args.student_id
     max_papers = args.max_papers
 
-    # Convert threshold MB to bytes
     bib_threshold_bytes = int(args.bib_threshold_mb * 1024 * 1024)
     scraper = ArxivScraper(student_id, max_papers=max_papers, skip_large_bib=args.skip_large_bib, bib_size_threshold=bib_threshold_bytes, skip_missing_source=args.skip_no_source)
 
     if args.paper_id:
         try:
-            # Fetch references for this single paper so references.json can be created
             logger.info(f"Fetching references for single paper {args.paper_id}")
 
             success = scraper.process_single_paper(args.paper_id)

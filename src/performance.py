@@ -75,7 +75,6 @@ class PerformanceMonitor:
     def set_final_output_bytes(self, bytes_used: int):
         try:
             self.final_output_bytes = int(bytes_used or 0)
-            # ensure disk peak at least final size
             if self.final_output_bytes > self.disk_peak_bytes:
                 self.disk_peak_bytes = self.final_output_bytes
         except Exception:
@@ -114,7 +113,7 @@ class PerformanceMonitor:
             self.paper_stage_times.setdefault(pid, {})
             self.paper_stage_times[pid][stg] = float(duration or 0.0)
 
-            # Compute total from recorded stages and store in paper_times
+            # Compute total
             total = sum(self.paper_stage_times[pid].values())
             self.paper_times[pid] = float(total)
         except Exception:
@@ -135,7 +134,7 @@ class PerformanceMonitor:
             pid = str(paper_id)
             self.paper_size_before[pid] = int(size_before or 0)
             self.paper_size_after[pid] = int(size_after or 0)
-            # update disk peak estimate
+            # Update disk peak
             try:
                 if size_before and size_before > self.disk_peak_bytes:
                     self.disk_peak_bytes = size_before
@@ -161,6 +160,7 @@ class PerformanceMonitor:
         logger.info(f"Initial memory: {self.initial_memory:.2f} MB")
         logger.info(f"Peak memory: {self.peak_memory:.2f} MB")
         logger.info(f"Average memory: {avg_memory:.2f} MB")
+        
         # Disk statistics
         try:
             peak_mb = self.disk_peak_bytes / (1024 * 1024)
@@ -210,6 +210,7 @@ class PerformanceMonitor:
                 logger.info("\nPer-paper timings: none recorded")
         except Exception:
             pass
+        
         # Average
         try:
             if self.paper_times:
@@ -233,7 +234,6 @@ class PerformanceMonitor:
         
         logger.info("=" * 80)
         
-        # Return a flattened summary (merge statistics into top-level)
         return self.get_summary_dict()
     
     def get_summary_dict(self):
@@ -313,16 +313,13 @@ class PerformanceMonitor:
                 except Exception:
                     pass
 
-            # detect source presence under `tex/` (any .tex or other non-placeholder file)
+            # Detect source presence under `tex/` (any .tex or other non-placeholder file)
             tex_dir = p / 'tex'
             has_source = False
             if tex_dir.exists():
                 for root, dirs, files in os.walk(tex_dir):
                     for fn in files:
                         if fn.lower().endswith('.tex'):
-                            has_source = True
-                            break
-                        if fn != 'NO_SOURCE_AVAILABLE.txt':
                             has_source = True
                             break
                     if has_source:

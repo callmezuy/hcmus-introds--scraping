@@ -66,9 +66,8 @@ def format_arxiv_id(month, paper_id):
     Returns:
         str: Formatted arXiv ID (e.g., "2402.10011")
     """
-    # Extract year and month, use only last 2 digits of year
     parts = month.split('-')
-    year = parts[0][-2:]  # Last 2 digits of year
+    year = parts[0][-2:]
     month_num = parts[1]
     return f"{year}{month_num}.{paper_id:05d}"
 
@@ -89,7 +88,7 @@ def parse_arxiv_id(arxiv_id):
     year_month = parts[0]
     paper_id = int(parts[1])
     
-    # Convert YYMM to YYYY-MM (assuming 20xx for years)
+    # Convert YYMM to YYYY-MM
     if len(year_month) == 4:
         month = f"20{year_month[:2]}-{year_month[2:]}"
     else:
