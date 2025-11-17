@@ -72,15 +72,7 @@ class ArxivScraper:
         # Behavior: whether to skip papers that have no downloadable source
         self.skip_missing_source = skip_missing_source
 
-    def _is_version_downloaded(self, paper_id, version_tag):
-        if not version_tag:
-            return False
-        try:
-            return paper_id in self.download_cache and version_tag in (self.download_cache.get(paper_id) or [])
-        except Exception:
-            return False
-
-    def _mark_version_downloaded(self, paper_id, version_tag):
+    def mark_version_downloaded(self, paper_id, version_tag):
         if not version_tag:
             return
         with self.download_cache_lock:
@@ -365,6 +357,15 @@ class ArxivScraper:
                             logger.warning(f"Extraction failed for {pid} {version_tag}, keeping downloaded file for inspection")
 
                         try:
+                            # Record size before removing figures (if monitor available)
+                            size_before = 0
+                            size_after = 0
+                            if extract_dir and os.path.exists(extract_dir):
+                                try:
+                                    size_before = self.file_processor.get_directory_size(extract_dir)
+                                except Exception:
+                                    size_before = 0
+
                             versioned_subfolder = pid
                             if version_tag:
                                 versioned_subfolder = f"{pid}{version_tag}"
@@ -375,7 +376,21 @@ class ArxivScraper:
                             logger.warning(f"Failed to copy tex/bib for {pid} {version_tag}: {e}")
 
                         try:
-                            self.file_processor.remove_figures(extract_dir)
+                            # Remove figures from the extracted tree (saves space)
+                            files_removed, bytes_saved = self.file_processor.remove_figures(extract_dir)
+                            try:
+                                if extract_dir and os.path.exists(extract_dir):
+                                    size_after = self.file_processor.get_directory_size(extract_dir)
+                            except Exception:
+                                size_after = 0
+
+                            # Record per-paper sizes (before/after) in the performance monitor
+                            try:
+                                if hasattr(self, 'monitor') and getattr(self, 'monitor', None) is not None and hasattr(self.monitor, 'record_paper_sizes'):
+                                    # Use pid with version tag only for per-version granularity if desired; here we store per-paper (pid)
+                                    self.monitor.record_paper_sizes(pid, size_before, size_after)
+                            except Exception:
+                                pass
                         except Exception:
                             pass
 
@@ -383,7 +398,7 @@ class ArxivScraper:
                         try:
                             if copied and version_tag:
                                 try:
-                                    self._mark_version_downloaded(pid, version_tag)
+                                    self.mark_version_downloaded(pid, version_tag)
                                 except Exception:
                                     pass
                         except Exception:

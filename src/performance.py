@@ -22,8 +22,9 @@ class PerformanceMonitor:
         self.disk_peak_bytes = 0
         self.final_output_bytes = 0
         self.paper_times = {}
-        # Per-paper per-stage durations: {paper_id: { 'metadata': float, 'processing': float, 'references': float }}
         self.paper_stage_times = {}
+        self.paper_size_before = {}
+        self.paper_size_after = {}
 
         # Statistics
         self.stats = {
@@ -118,6 +119,32 @@ class PerformanceMonitor:
             self.paper_times[pid] = float(total)
         except Exception:
             pass
+
+    def record_paper_sizes(self, paper_id: str, size_before: int, size_after: int):
+        """
+        Record per-paper sizes in bytes: before and after figure removal.
+
+        Args:
+            paper_id: paper identifier
+            size_before: total bytes including figures
+            size_after: total bytes after removing figure files
+        """
+        try:
+            if not paper_id:
+                return
+            pid = str(paper_id)
+            self.paper_size_before[pid] = int(size_before or 0)
+            self.paper_size_after[pid] = int(size_after or 0)
+            # update disk peak estimate
+            try:
+                if size_before and size_before > self.disk_peak_bytes:
+                    self.disk_peak_bytes = size_before
+                if size_after and size_after > self.disk_peak_bytes:
+                    self.disk_peak_bytes = size_after
+            except Exception:
+                pass
+        except Exception:
+            pass
     
     def stop(self):
         """Stop monitoring and calculate final metrics"""
@@ -140,6 +167,16 @@ class PerformanceMonitor:
             final_mb = self.final_output_bytes / (1024 * 1024)
             logger.info(f"Peak disk usage: {peak_mb:.2f} MB")
             logger.info(f"Final output size: {final_mb:.2f} MB")
+        except Exception:
+            pass
+
+        # Average paper sizes (before/after figure removal)
+        try:
+            if self.paper_size_before:
+                avg_before = sum(self.paper_size_before.values()) / len(self.paper_size_before)
+                avg_after = sum(self.paper_size_after.values()) / len(self.paper_size_after) if self.paper_size_after else avg_before
+                logger.info(f"Average paper size (incl. figures): {avg_before/1024/1024:.2f} MB")
+                logger.info(f"Average paper size (excl. figures): {avg_after/1024/1024:.2f} MB")
         except Exception:
             pass
         
@@ -206,9 +243,9 @@ class PerformanceMonitor:
         summary = {
             'total_time_seconds': total_time,
             'total_time_minutes': total_time / 60,
-            'initial_memory_mb': self.initial_memory,
-            'peak_memory_mb': self.peak_memory,
-            'average_memory_mb': avg_memory,
+            'initial_memory': self.initial_memory,
+            'peak_memory': self.peak_memory,
+            'average_memory': avg_memory,
         }
         max_disk_bytes = int(self.disk_peak_bytes or 0)
         final_bytes = int(self.final_output_bytes or 0)
@@ -216,12 +253,23 @@ class PerformanceMonitor:
         avg_paper_time = (sum(self.paper_times.values()) / len(self.paper_times)) if self.paper_times else 0
 
         summary.update({
-            'max_disk_bytes': max_disk_bytes,
-            'max_disk_mb': max_disk_bytes / (1024 * 1024) if max_disk_bytes else 0,
-            'final_output_bytes': final_bytes,
-            'final_output_mb': final_bytes / (1024 * 1024) if final_bytes else 0,
+            'max_disk': max_disk_bytes / (1024 * 1024) if max_disk_bytes else 0,
+            'final_output': final_bytes / (1024 * 1024) if final_bytes else 0,
             'paper_times': self.paper_times,
             'avg_paper_time_seconds': avg_paper_time,
+        })
+
+        # Add average paper sizes
+        try:
+            avg_size_before = (sum(self.paper_size_before.values()) / len(self.paper_size_before)) if self.paper_size_before else 0
+            avg_size_after = (sum(self.paper_size_after.values()) / len(self.paper_size_after)) if self.paper_size_after else 0
+        except Exception:
+            avg_size_before = 0
+            avg_size_after = 0
+
+        summary.update({
+            'avg_paper_size_before': avg_size_before / (1024 * 1024) if avg_size_before else 0,
+            'avg_paper_size_after': avg_size_after / (1024 * 1024) if avg_size_after else 0
         })
 
         summary.update(self.stats)
@@ -281,6 +329,29 @@ class PerformanceMonitor:
                         break
             if has_source:
                 papers_with_source += 1
+
+            # Compute per-paper sizes
+            try:
+                total_bytes_all = 0
+                total_bytes_excluding_images = 0
+                image_exts = {'.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tif', '.tiff', '.svg', '.pdf'}
+                for root, dirs, files in os.walk(p):
+                    for fn in files:
+                        try:
+                            fp = os.path.join(root, fn)
+                            sz = os.path.getsize(fp)
+                            total_bytes_all += sz
+                            _, ext = os.path.splitext(fn)
+                            if ext.lower() not in image_exts:
+                                total_bytes_excluding_images += sz
+                        except Exception:
+                            continue
+
+                pid = p.name
+                self.paper_size_before[pid] = int(total_bytes_all)
+                self.paper_size_after[pid] = int(total_bytes_excluding_images)
+            except Exception:
+                pass
 
         skipped_papers = total_papers - papers_with_source
 
